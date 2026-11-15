@@ -52,7 +52,7 @@ INJECTION_PATTERNS = [
     r"игнорируй (все |предыдущие |прошлые )?инструкции",
     r"забудь (все )?(предыдущие )?инструкции", r"ты теперь",
     r"системн(ый|ого) промпт", r"выполни (команду|следующее)",
-    r"curl [^\n]*\|\s*(ba)?sh", r"rm -rf", r"<\s*script",
+    r"curl [^\n]*\|\s*(ba)?sh", r"rm -rf",
 ]
 
 
@@ -674,7 +674,7 @@ def cmd_claim(a):
         write_jsonl(p.claims, rows)
         journal(p, f"{cid} [{a.kind}] {a.text[:120]}", "claim")
         render_status(p)
-        print(cid)
+        print(f"{cid}\t[{a.kind}] {a.text[:90]}")
     elif a.action == "retract":
         c = claim_ids.get(a.text.upper()) or die("нет такого утверждения")
         c["status"] = "retracted"
@@ -978,13 +978,21 @@ def price_for(model: str, pricing: dict) -> dict:
 def transcript_dirs() -> list[Path]:
     base = Path.home() / ".claude" / "projects"
     enc = re.sub(r"[^A-Za-z0-9]", "-", str(ROOT))
-    return [d for d in base.glob("*") if d.is_dir() and d.name.startswith(enc)] if base.exists() else []
+    # Сессия могла быть запущена из этой папки, вложенной или родительской (тогда фильтр по времени
+    # в cmd_cost отсекает работу до создания проекта).
+    return [d for d in base.glob("*") if d.is_dir() and (d.name.startswith(enc) or enc.startswith(d.name + "-"))] \
+        if base.exists() else []
 
 
 def cmd_cost(a):
     p = P(project_dir(a.project))
     st = load_state(p)
-    since = a.since or st.get("created", "")[:19]
+    since = a.since or st.get("created", "")
+    if since:  # журналы Claude Code хранят время в UTC — приводим к нему
+        sdt = dt.datetime.fromisoformat(since.replace("Z", "+00:00"))
+        if sdt.tzinfo is None:
+            sdt = sdt.astimezone()
+        since = sdt.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     pricing = load_pricing()
     agg: dict[str, dict] = {}
     seen = set()
