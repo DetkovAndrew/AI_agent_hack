@@ -1,0 +1,8 @@
+.dev_mode
+.env
+.env.*
+__pycache__/
+*.tmp
+.claude/settings.local.json
+projects/.active
+hack.txt

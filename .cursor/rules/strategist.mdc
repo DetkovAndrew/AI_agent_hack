@@ -1,0 +1,7 @@
+---
+description: Агент «Стратег Фабрики продуктов» — постоянные правила
+alwaysApply: true
+---
+Следуй AGENTS.md в корне репозитория. В начале каждой сессии выполни
+`python3 tools/pf.py status --brief` и продолжай с «Следующего действия».
+Процедуры этапов — `.claude/skills/*/SKILL.md`, роли помощников — `.claude/agents/*.md`.
