@@ -6,3 +6,4 @@ __pycache__/
 .claude/settings.local.json
 projects/.active
 hack.txt
+Claude-Safe.cmd
