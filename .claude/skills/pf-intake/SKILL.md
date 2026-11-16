@@ -40,7 +40,8 @@ description: Этап 0 — постановка задачи. Уточнить 
 1. Ответ PM на постановку не жди, если вопросов нет: запиши допущения и иди дальше.
 2. Материалы — `pf.py ingest`; веб — 2–4 целевых поиска только по ключевым вопросам.
 3. Ключевые утверждения и пробелы — одним `pf.py batch analysis/registry_batch.txt`.
-4. Расчёты — один скрипт в `analysis/`.
+4. Расчёты — один скрипт в `analysis/` с разделом «Устойчивость» в `_result.md`
+   (границы периодов, база сравнения, сверка сумм — `.claude/agents/data-analyst.md`, п. 3а).
 5. `red-team` (Agent, `model: sonnet`) — возражения к рекомендации, один проход.
 6. `deliverables/summary.md` по `knowledge/templates/quick.md`; `judge` сверяет обещания,
    вердикты — `pf.py source add --kind analysis --title "Вердикты judge: ..."`.

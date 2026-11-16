@@ -1076,6 +1076,10 @@ def cmd_check(a):
                     if cid:
                         warnings.append(f"{f.relative_to(p.d)}:{ln}: «{m.strip()}» — цифра из "
                                         f"отозванного {cid}; обновите или пометьте как прежнюю")
+    for f in sorted((p.d / "analysis").glob("*_result.md")):
+        if "устойчив" not in f.read_text(encoding="utf-8").lower():
+            warnings.append(f"{f.relative_to(p.d)}: нет раздела «Устойчивость» (меняется ли вывод при "
+                            f"сдвиге периодов, другой базе, других допущениях) — см. роль data-analyst")
     cited = set()
     for f in md_files(p):
         for grp in CITE_RE.findall(f.read_text(encoding="utf-8")):
