@@ -970,6 +970,11 @@ def cmd_check(a):
                     warnings.append(f"{name}: не найден обязательный раздел «{n}…»")
             if not CITE_RE.search(t):
                 warnings.append(f"{name}: нет ни одной ссылки на утверждения [Cxxx]")
+    if (p.d / "deliverables/comms_strategy.md").exists() and not any(
+            "judge" in (x.get("title") or "").lower() for x in srcs.values()):
+        warnings.append("comms_strategy.md: нет независимой сверки обещаний — запустите субагента "
+                        "judge и зарегистрируйте вердикты: pf.py source add --kind analysis "
+                        "--title \"Вердикты judge: обещания vs продукт\" --text \"...\"")
     if a.quiet and not problems and not warnings:
         return
     for x in problems:
