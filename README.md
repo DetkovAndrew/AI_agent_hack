@@ -97,3 +97,14 @@ python3 tools/pf.py report --html     # итоговый отчёт
 
 ## Структура
 См. `docs/` — архитектура, ключевые решения, план работ.
+
+## Материалы для сдачи
+- `docs/submission/report.md` — описание работы (архитектура, модели и сервисы, промпты,
+  дополнительный уровень, время и расходы, ограничения). Незаполненное помечено `::: todo`.
+- `docs/ai-log/JOURNAL.md` — журнал работы с ИИ: кто что делал, ошибки ИИ, помощь человека.
+  Пополняется по ходу работы.
+- Сборка PDF (нужны Node.js и Chromium для Playwright, ядру агента они не нужны):
+  ```bash
+  cd scripts/report && npm install && npx playwright install chromium
+  node build.mjs        # → docs/submission/report.pdf
+  ```

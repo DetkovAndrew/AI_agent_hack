@@ -7,3 +7,5 @@ __pycache__/
 projects/.active
 hack.txt
 Claude-Safe.cmd
+node_modules/
+docs/submission/report.html
