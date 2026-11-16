@@ -5,5 +5,6 @@ __pycache__/
 *.tmp
 .claude/settings.local.json
 projects/.active
+projects/.lock
 hack.txt
 Claude-Safe.cmd

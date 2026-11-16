@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import html
@@ -24,8 +25,10 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PROJECTS = ROOT / "projects"
+# PF_PROJECTS_DIR — другая папка проектов (тесты, отдельное рабочее место).
+PROJECTS = Path(os.environ.get("PF_PROJECTS_DIR") or ROOT / "projects").resolve()
 ACTIVE_FILE = PROJECTS / ".active"
+LOCK_FILE = PROJECTS / ".lock"
 PRICING_FILE = ROOT / "tools" / "pricing.json"
 
 STAGES = ["intake", "collect", "research", "options", "choice", "strategy",
@@ -64,6 +67,14 @@ def now() -> str:
 
 def today() -> str:
     return dt.date.today().isoformat()
+
+
+def shown(path: Path) -> str:
+    """Путь для вывода: от корня репозитория, если проект внутри него."""
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 def die(msg: str, code: int = 1):
@@ -107,6 +118,39 @@ def append_jsonl(p: Path, row: dict):
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+@contextlib.contextmanager
+def store_lock():
+    """Исключительная блокировка хранилища на время команды.
+
+    Субагенты вызывают pf.py параллельно, а реестры меняются по схеме «прочитать → дописать →
+    переписать файл» и получают ID через next_id. Без блокировки одновременные записи теряются
+    молча, а два процесса могут выдать один и тот же ID.
+    """
+    PROJECTS.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, "a+b") as f:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:  # LK_LOCK сдаётся через ~10 с — ждём дальше
+                    continue
+            try:
+                yield
+            finally:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def next_id(rows: list[dict], prefix: str) -> str:
@@ -484,6 +528,9 @@ def extract_text(path: Path) -> str:
         return extract_pdf(path)
     if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
         return "[Изображение: агент читает его напрямую (Read). Опишите только видимое.]"
+    if ext in {".mp3", ".wav", ".m4a", ".ogg", ".mp4", ".mov", ".webm", ".mkv"}:
+        return (f"[Аудио/видео {ext}: pf.py не расшифровывает. Зарегистрируйте расшифровку "
+                f"(.srt/.vtt/.txt) и кадры (.png) — см. docs/media.md]")
     return f"[Формат {ext} не извлекается автоматически]"
 
 
@@ -572,9 +619,16 @@ def cmd_fetch(a):
             data = r.read()
             ctype = r.headers.get("Content-Type", "")
     except Exception as e:  # noqa: BLE001
-        journal(p, f"НЕ УДАЛОСЬ загрузить {a.url}: {e}", "error")
+        with store_lock():
+            journal(p, f"НЕ УДАЛОСЬ загрузить {a.url}: {e}", "error")
         die(f"не удалось загрузить {a.url}: {e}. Ошибка записана в журнал; "
             f"используйте другой источник или WebFetch.", 2)
+    # Загрузка идёт без блокировки (может длиться до --timeout), регистрация — под ней.
+    with store_lock():
+        _register_fetched(p, a, data, ctype)
+
+
+def _register_fetched(p: P, a, data: bytes, ctype: str):
     if "pdf" in ctype or a.url.lower().endswith(".pdf"):
         ext = ".pdf"
     elif "html" in ctype:
@@ -616,10 +670,7 @@ def cmd_ingest(a):
     for f in files:
         data = f.read_bytes()
         text = extract_text(f)
-        try:
-            rel = str(f.relative_to(ROOT))
-        except ValueError:
-            rel = str(f)
+        rel = shown(f)
         row = register_source(p, kind=a.kind or "document", title=a.title or f.name,
                               path=rel, text=text, raw_bytes=data, ext=f.suffix.lower(),
                               reliability=a.reliability, note=a.note,
@@ -754,7 +805,11 @@ def cmd_gap(a):
 # ---------------------------------------------------------------- решения
 
 def due_decisions(p: P) -> list[tuple[dict, list[str]]]:
-    claims = {c["id"]: c for c in read_jsonl(p.claims)}
+    rows = read_jsonl(p.claims)
+    claims = {c["id"]: c for c in rows}
+    retracted = {c["id"] for c in rows if c["status"] != "active"}
+    # Как в impact: основание, выведенное из отозванного, тоже устарело.
+    tainted = dependents(rows, retracted) - retracted
     out = []
     for d in read_jsonl(p.decisions):
         if d.get("status") not in ("active", None):
@@ -768,6 +823,9 @@ def due_decisions(p: P) -> list[tuple[dict, list[str]]]:
                 reasons.append(f"основание {cid} не найдено")
             elif c["status"] != "active":
                 reasons.append(f"основание {cid} отозвано ({c.get('retract_reason')})")
+            elif cid in tainted:
+                reasons.append(f"основание {cid} выведено из отозванного — проверьте: "
+                               f"pf.py impact --claim {cid}")
         for cm in d.get("commitments", []):
             if cm.get("status") == "open" and cm.get("due") and cm["due"] < today():
                 reasons.append(f"просрочено обязательство «{cm['text']}» ({cm.get('owner')})")
@@ -889,8 +947,8 @@ def md_files(p: P) -> list[Path]:
     return out
 
 
-def cmd_check(a):
-    p = P(project_dir(a.project))
+def collect_checks(p: P) -> tuple[list[str], list[str]]:
+    """Ошибки (нарушена целостность — исправить обязательно) и предупреждения."""
     claims = {c["id"]: c for c in read_jsonl(p.claims)}
     srcs = {s["id"]: s for s in read_jsonl(p.sources)}
     gaps = {g["id"]: g for g in read_jsonl(p.gaps)}
@@ -975,6 +1033,12 @@ def cmd_check(a):
         warnings.append("comms_strategy.md: нет независимой сверки обещаний — запустите субагента "
                         "judge и зарегистрируйте вердикты: pf.py source add --kind analysis "
                         "--title \"Вердикты judge: обещания vs продукт\" --text \"...\"")
+    return problems, warnings
+
+
+def cmd_check(a):
+    p = P(project_dir(a.project))
+    problems, warnings = collect_checks(p)
     if a.quiet and not problems and not warnings:
         return
     for x in problems:
@@ -1183,11 +1247,11 @@ def cmd_report(a):
                      f"{', надёжность: ' + s['reliability'] if s.get('reliability') else ''})")
     out = dl / "REPORT.md"
     out.write_text("\n".join(parts) + "\n", encoding="utf-8")
-    print(f"Отчёт: {out.relative_to(ROOT)}")
+    print(f"Отчёт: {shown(out)}")
     if a.html:
         hp = dl / "REPORT.html"
         hp.write_text(md_to_html(out.read_text(encoding="utf-8"), st["title"]), encoding="utf-8")
-        print(f"HTML: {hp.relative_to(ROOT)}")
+        print(f"HTML: {shown(hp)}")
 
 
 def md_to_html(md: str, title: str) -> str:
@@ -1243,7 +1307,19 @@ def md_to_html(md: str, title: str) -> str:
 # ---------------------------------------------------------------- хуки
 
 def cmd_hook(a):
-    """Точки входа для хуков Claude Code. Никогда не падают с ошибкой."""
+    """Точки входа для хуков Claude Code. Сбой самого хука работу не останавливает.
+
+    SessionStart: stdout попадает в контекст модели.
+    Stop: stdout с кодом 0 модель НЕ видит (только человек в подробном режиме). Поэтому при
+    ошибках целостности хук завершается с кодом 2 и пишет их в stderr — Claude Code не даёт
+    закончить ответ и передаёт текст модели. Предупреждения ответ не блокируют. Если ответ уже
+    продолжается из-за этого хука (stop_hook_active), повторно не блокируем — без зацикливания.
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}") if not sys.stdin.isatty() else {}
+    except (json.JSONDecodeError, OSError, ValueError):
+        payload = {}
+    block = None
     try:
         slug = active_slug()
         if a.event == "session-start":
@@ -1256,12 +1332,20 @@ def cmd_hook(a):
                 print("[pf] Активного проекта нет. Предложите пользователю /pf-start.")
         elif a.event == "stop":
             if slug and (PROJECTS / slug / "state.json").exists():
-                ns = argparse.Namespace(project=slug, quiet=True, strict=False)
-                cmd_check(ns)
+                problems, warnings = collect_checks(P(project_dir(slug)))
+                for x in warnings:
+                    print(f"ВНИМ.   {x}")
+                if problems and not payload.get("stop_hook_active"):
+                    block = ("[pf] pf.py check нашёл ошибки целостности — исправь их до "
+                             "завершения ответа (или объясни PM, почему сейчас нельзя):\n" +
+                             "\n".join(f"ОШИБКА  {x}" for x in problems))
     except SystemExit:
         pass
     except Exception as e:  # noqa: BLE001
         print(f"[pf] hook error: {e}")
+    if block:
+        print(block, file=sys.stderr)
+        sys.exit(2)
 
 
 # ---------------------------------------------------------------- CLI
@@ -1371,7 +1455,11 @@ def main():
     s.add_argument("event", choices=["session-start", "stop"]); s.set_defaults(fn=cmd_hook)
 
     a = ap.parse_args()
-    a.fn(a)
+    if a.fn is cmd_fetch:  # блокирует сам, после загрузки
+        a.fn(a)
+    else:
+        with store_lock():
+            a.fn(a)
 
 
 if __name__ == "__main__":
