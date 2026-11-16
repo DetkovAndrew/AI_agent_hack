@@ -882,6 +882,19 @@ def cmd_check(a):
                         problems.append(f"{rel}:{ln}: нет источника {ref}")
                     elif ref.startswith("G") and ref not in gaps:
                         problems.append(f"{rel}:{ln}: нет пробела {ref}")
+    cited = set()
+    for f in md_files(p):
+        for grp in CITE_RE.findall(f.read_text(encoding="utf-8")):
+            cited |= set(split_ids(grp))
+    for c in claims.values():
+        cited |= set(c.get("derived_from", []))
+    for d in read_jsonl(p.decisions):
+        cited |= set(d.get("basis", []))
+    for c in claims.values():
+        if c["status"] == "active" and c["kind"] == "assumption" and c["id"] not in cited:
+            warnings.append(f"{c['id']}: допущение нигде не процитировано — при его отзыве "
+                            f"impact не найдёт зависящие выводы; сошлитесь на него в документе "
+                            f"или в основании решения")
     for name, need in [("deliverables/options.md", ["Оставить как есть", "Возражени"]),
                        ("deliverables/product_strategy.md", ["Аудитория", "Альтернатив", "Отказ"]),
                        ("deliverables/comms_strategy.md", ["Барьер", "Ключевое сообщение",
@@ -934,22 +947,39 @@ def cmd_impact(a):
         start |= {c["id"] for c in claims if set(c.get("tags", [])) & tags}
     hit = dependents(claims, start)
     byid = {c["id"]: c for c in claims}
+    # Теги затронутых утверждений (пробелы G, вопросы Q) тоже ведут к выводам:
+    # допущение часто не цитируют напрямую, но цитируют пробел, который оно закрывает.
+    tags = {t for cid in hit for t in byid.get(cid, {}).get("tags", [])
+            if re.fullmatch(r"[GQ]\d{3}", t)}
     print("## Затронутые утверждения")
     for cid in sorted(hit):
         c = byid.get(cid)
         if c:
             mark = "прямо" if cid in start else "косвенно"
             print(f"- {cid} [{c['kind']}, {mark}] {c['text'][:100]}")
+    if tags:
+        print(f"\nСвязанные пробелы и вопросы (по тегам): {', '.join(sorted(tags))}")
     print("\n## Где они используются")
-    found = False
+    found, touched = False, set()
     for f in md_files(p):
+        if f.name == "REPORT.md":  # собирается из остальных документов
+            continue
         for ln, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
             refs = {r for g in CITE_RE.findall(line) for r in split_ids(g)}
-            if refs & hit:
+            if refs & (hit | tags):
                 found = True
-                print(f"- {f.relative_to(p.d)}:{ln}: {line.strip()[:120]}")
+                touched.add(f)
+                via = "" if refs & hit else " (через тег)"
+                print(f"- {f.relative_to(p.d)}:{ln}{via}: {line.strip()[:120]}")
     if not found:
         print("- (в документах ссылок нет)")
+    rest = [f for f in sorted((p.d / "deliverables").glob("*.md"))
+            if f not in touched and f.name not in ("REPORT.md", "changelog.md")]
+    if rest:
+        print("\nПрямых ссылок нет, но вывод мог опираться на эти сведения неявно — "
+              "просмотрите и отметьте в changelog «затронут / не затронут»:")
+        for f in rest:
+            print(f"- {f.relative_to(p.d)}")
     print("\n## Решения на этих основаниях")
     for d in read_jsonl(p.decisions):
         if set(d.get("basis", [])) & hit:
