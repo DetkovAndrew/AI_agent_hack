@@ -719,6 +719,20 @@ def cmd_gap(a):
         write_jsonl(p.gaps, rows)
         render_status(p)
         print(f"{g['id']} закрыт")
+    elif a.action == "edit":
+        g = next((g for g in rows if g["id"] == a.text.upper()), None) or die("нет пробела")
+        changes = {k: v for k, v in [("text", a.new_text), ("why_unknown", a.why),
+                                     ("impact", a.impact), ("how_to_close", a.how)] if v}
+        if not changes:
+            die("нечего менять: --new-text / --why / --impact / --how")
+        g.setdefault("history", []).append({"at": now(), "before": {k: g.get(k) for k in changes},
+                                            "note": a.reason})
+        g.update(changes)
+        write_jsonl(p.gaps, rows)
+        journal(p, f"Пробел {g['id']} уточнён: {', '.join(changes)}" +
+                (f" — {a.reason}" if a.reason else ""), "gap")
+        render_status(p)
+        print(f"{g['id']} обновлён")
     elif a.action == "list":
         for g in rows:
             print(f"{g['id']}\t{g['status']}\t{g.get('impact') or '-'}\t{g['text']}")
@@ -791,6 +805,29 @@ def cmd_decision(a):
         write_jsonl(p.decisions, rows)
         journal(p, f"Решение {d['id']} → {a.title}: {a.rationale}", "decision")
         print(f"{d['id']} → {a.title}")
+    elif a.action == "edit":
+        d = next((d for d in rows if d["id"] == (a.id or "").upper()), None) or die("нет решения")
+        fields = [("title", a.title), ("rationale", a.rationale), ("owner", a.owner),
+                  ("metric", a.metric), ("review_trigger", a.trigger),
+                  ("review_date", a.review_date)]
+        changes = {k: v for k, v in fields if v}
+        if a.basis:
+            basis = split_ids(a.basis)
+            bad = [b for b in basis if b not in claims]
+            if bad:
+                die(f"неизвестные основания: {bad}")
+            changes["basis"] = basis
+        if not changes:
+            die("нечего менять: --title / --rationale / --owner / --basis / --metric / "
+                "--trigger / --review-date")
+        d["history"].append({"at": now(), "edit": {k: d.get(k) for k in changes},
+                             "note": a.note})
+        d.update(changes)
+        write_jsonl(p.decisions, rows)
+        journal(p, f"Решение {d['id']} уточнено: {', '.join(changes)}" +
+                (f" — {a.note}" if a.note else ""), "decision")
+        render_status(p)
+        print(f"{d['id']} обновлено")
     elif a.action == "list":
         for d in rows:
             print(f"{d['id']}\t{d['status']}\t{d.get('owner') or '-'}\t"
@@ -882,6 +919,17 @@ def cmd_check(a):
                         problems.append(f"{rel}:{ln}: нет источника {ref}")
                     elif ref.startswith("G") and ref not in gaps:
                         problems.append(f"{rel}:{ln}: нет пробела {ref}")
+    for row in list(gaps.values()) + read_jsonl(p.decisions):
+        blob = " ".join(str(row.get(k) or "") for k in
+                        ("text", "why_unknown", "how_to_close", "title", "rationale",
+                         "review_trigger", "metric"))
+        refs = set(re.findall(r"C\d{3}", blob)) | set(row.get("basis", []))
+        for ref in sorted(refs):
+            if ref in claims and claims[ref]["status"] != "active" and \
+                    not (row["id"].startswith("D") and row.get("status") != "active"):
+                kind = "пробел" if row["id"].startswith("G") else "решение"
+                warnings.append(f"{row['id']}: {kind} ссылается на отозванное {ref} — "
+                                f"уточните через `pf.py {'gap' if kind == 'пробел' else 'decision'} edit`")
     cited = set()
     for f in md_files(p):
         for grp in CITE_RE.findall(f.read_text(encoding="utf-8")):
@@ -1265,13 +1313,15 @@ def main():
     s.set_defaults(fn=cmd_claim)
 
     s = sp.add_parser("gap", help="пробелы в знаниях: add | close | list")
-    s.add_argument("action", choices=["add", "close", "list"]); s.add_argument("text", nargs="?", default="")
+    s.add_argument("action", choices=["add", "close", "edit", "list"]); s.add_argument("text", nargs="?", default="")
+    s.add_argument("--new-text", dest="new_text", help="edit: новая формулировка"); s.add_argument("--reason")
     s.add_argument("--why"); s.add_argument("--impact", choices=["low", "medium", "high"])
     s.add_argument("--how"); s.add_argument("--q"); s.add_argument("--by")
     s.set_defaults(fn=cmd_gap)
 
-    s = sp.add_parser("decision", help="решения: add | commit | done | status | list")
-    s.add_argument("action", choices=["add", "commit", "done", "status", "list"])
+    s = sp.add_parser("decision", help="решения: add | commit | done | status | edit | list")
+    s.add_argument("action", choices=["add", "commit", "done", "status", "edit", "list"])
+    s.add_argument("--note", help="edit: почему меняем")
     s.add_argument("--id"); s.add_argument("--title"); s.add_argument("--rationale")
     s.add_argument("--owner"); s.add_argument("--basis"); s.add_argument("--metric")
     s.add_argument("--trigger", help="условие пересмотра"); s.add_argument("--review-date", dest="review_date")
