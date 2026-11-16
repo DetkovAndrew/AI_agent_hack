@@ -8,3 +8,4 @@ projects/.active
 projects/.lock
 hack.txt
 Claude-Safe.cmd
+node_modules/
