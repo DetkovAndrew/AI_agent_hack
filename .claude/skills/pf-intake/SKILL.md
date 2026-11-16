@@ -16,18 +16,36 @@ description: Этап 0 — постановка задачи. Уточнить 
    - Ограничения (срок, бюджет, технологии, бренд, регуляторика)
    - Доступные данные; разрешённые источники (по умолчанию: открытые сайты + файлы PM)
    - Критерии выбора варианта (что важнее: рост, маржа, риск, скорость)
+2а. Выбери глубину (AGENTS.md, раздел 3а) и предложи её в том же блоке: «быстрый ответ за
+   один проход или полный разбор по документам». По умолчанию — `quick`; `full` — по условиям
+   из AGENTS.md (раздел 3а). Запиши `pf.py set brief.depth quick|full`.
+   **В быстром режиме** дальше иди по разделу «Быстрый режим» ниже, а не по этапам.
 3. Задай **только** недостающее, что меняет следующий шаг — максимум 5 вопросов, к каждому
    свой вариант по умолчанию. Используй AskUserQuestion, если доступен.
-4. Запиши ответы:
+4. Запиши ответы — удобнее одним `pf.py batch analysis/brief_batch.txt`, по строке на команду:
    ```
-   pf.py set brief.question "..."; pf.py set brief.goal "..."; pf.py set brief.recipient "..."
-   pf.py set brief.constraints "..." --append      # по одному
-   pf.py set brief.available_data "..." --append
-   pf.py set brief.allowed_sources "*.ru" --append # или конкретные домены / open-web
-   pf.py set brief.decision_criteria "..." --append
+   set brief.question "..."
+   set brief.goal "..."
+   set brief.recipient "..."
+   set brief.constraints "..." --append      # по одному
+   set brief.available_data "..." --append
+   set brief.allowed_sources "*.ru" --append # или конкретные домены / open-web
+   set brief.decision_criteria "..." --append
    ```
    Что PM не знает — `pf.py claim add "..." --kind assumption`.
 5. Ключевые вопросы (3–7), каждый — такой, ответ на который **меняет выбор варианта**:
    `pf.py question add "..." --why "если да → вариант A, если нет → B"`.
    Обязательно включи вопрос о том, стоит ли вообще продолжать направление.
 6. `pf.py stage collect --next "Загрузить файлы из inbox и найти источники по Q001–Q00N"`.
+
+## Быстрый режим (`brief.depth = quick`)
+1. Ответ PM на постановку не жди, если вопросов нет: запиши допущения и иди дальше.
+2. Материалы — `pf.py ingest`; веб — 2–4 целевых поиска только по ключевым вопросам.
+3. Ключевые утверждения и пробелы — одним `pf.py batch analysis/registry_batch.txt`.
+4. Расчёты — один скрипт в `analysis/` с разделом «Устойчивость» в `_result.md`
+   (границы периодов, база сравнения, сверка сумм — `.claude/agents/data-analyst.md`, п. 3а).
+5. `red-team` (Agent, `model: sonnet`) — возражения к рекомендации, один проход.
+6. `deliverables/summary.md` по `knowledge/templates/quick.md`; `judge` сверяет обещания,
+   вердикты — `pf.py source add --kind analysis --title "Вердикты judge: ..."`.
+7. `pf.py check`, `pf.py report`, `pf.py stage choice --next "PM подтверждает вариант или
+   просит полный разбор"`. Покажи PM ответ, варианты и спроси подтверждение.

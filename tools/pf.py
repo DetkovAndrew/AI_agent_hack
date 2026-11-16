@@ -120,6 +120,9 @@ def append_jsonl(p: Path, row: dict):
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+_lock_depth = 0
+
+
 @contextlib.contextmanager
 def store_lock():
     """Исключительная блокировка хранилища на время команды.
@@ -127,7 +130,17 @@ def store_lock():
     Субагенты вызывают pf.py параллельно, а реестры меняются по схеме «прочитать → дописать →
     переписать файл» и получают ID через next_id. Без блокировки одновременные записи теряются
     молча, а два процесса могут выдать один и тот же ID.
+    Повторный вход в том же процессе (fetch внутри batch) не блокирует: flock на втором
+    дескрипторе ждал бы сам себя.
     """
+    global _lock_depth
+    if _lock_depth:
+        _lock_depth += 1
+        try:
+            yield
+        finally:
+            _lock_depth -= 1
+        return
     PROJECTS.mkdir(parents=True, exist_ok=True)
     with open(LOCK_FILE, "a+b") as f:
         if os.name == "nt":
@@ -139,17 +152,21 @@ def store_lock():
                     break
                 except OSError:  # LK_LOCK сдаётся через ~10 с — ждём дальше
                     continue
+            _lock_depth = 1
             try:
                 yield
             finally:
+                _lock_depth = 0
                 f.seek(0)
                 msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
             fcntl.flock(f, fcntl.LOCK_EX)
+            _lock_depth = 1
             try:
                 yield
             finally:
+                _lock_depth = 0
                 fcntl.flock(f, fcntl.LOCK_UN)
 
 
@@ -671,7 +688,8 @@ def cmd_ingest(a):
         data = f.read_bytes()
         text = extract_text(f)
         rel = shown(f)
-        row = register_source(p, kind=a.kind or "document", title=a.title or f.name,
+        auto = "table" if f.suffix.lower() in {".csv", ".tsv", ".xlsx", ".xls"} else "document"
+        row = register_source(p, kind=a.kind or auto, title=a.title or f.name,
                               path=rel, text=text, raw_bytes=data, ext=f.suffix.lower(),
                               reliability=a.reliability, note=a.note,
                               published=a.published, origin=a.origin)
@@ -707,6 +725,87 @@ def cmd_source(a):
 
 # ---------------------------------------------------------------- утверждения
 
+def _norm(t: str) -> str:
+    t = t.lower().replace("ё", "е").replace("\u00ad", "")
+    t = re.sub(r"[\u2010-\u2015\u2212]", "-", t)
+    t = re.sub(r"[«»“”„\"'’`]", "", t)
+    t = re.sub(r"(?<=\d)[\s\u00a0\u202f](?=\d{3}\b)", "", t)  # 2 000 → 2000
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _numbers(t: str, claim: bool = False) -> set[str]:
+    """Значимые числа: от двух цифр или дробные (одиночные цифры слишком неспецифичны).
+    В тексте утверждения (русский) дробная часть — через запятую, а «07.09» — дата: её и годы
+    не сверяем, ID вида S001 выбрасываем."""
+    t = re.sub(r"\b[CSGDQ]\d{3}\b", " ", _norm(t), flags=re.I)
+    if claim:
+        t = re.sub(r"\b\d{1,2}\.\d{1,2}(?:\.\d{2,4})?\b", " ", t)
+        t = re.sub(r"\b(?:19|20)\d{2}\b", " ", t)
+    out = set()
+    for m in re.findall(r"\d+(?:[.,]\d+)?", t):
+        m = m.replace(",", ".")
+        if len(m.replace(".", "")) >= 2:
+            out.add(m)
+    return out
+
+
+def _covered(n: str, pool: set[str]) -> bool:
+    """Число есть в источнике — точно или как округление более точного значения."""
+    if n in pool:
+        return True
+    dec = len(n.split(".")[1]) if "." in n else 0
+    x = float(n)
+    tol = 0.5 * 10 ** -dec + 1e-9
+    return any("." in y and len(y.split(".")[1]) > dec and abs(float(y) - x) <= tol for y in pool)
+
+
+def source_texts(p: P, sids: list[str]) -> dict[str, str]:
+    srcs = {s["id"]: s for s in read_jsonl(p.sources)}
+    out = {}
+    for sid in sids:
+        s = srcs.get(sid) or {}
+        if s.get("text") and (p.d / s["text"]).exists():
+            out[sid] = (p.d / s["text"]).read_text(encoding="utf-8", errors="ignore")
+    return out
+
+
+def verify_claim(p: P, c: dict) -> dict:
+    """Механическая сверка факта со снимками источников: есть ли там цитата и числа из текста.
+    Ловит пересказ «по памяти» и искажённые цифры без участия модели."""
+    srows = read_jsonl(p.sources)
+    kinds = {s["id"]: s.get("kind") for s in srows}
+    tables = {s["id"] for s in srows if s.get("kind") == "table" or
+              str(s.get("path") or s.get("raw") or "").lower().endswith((".csv", ".tsv", ".xlsx", ".xls"))}
+    texts = source_texts(p, c.get("sources", []))
+    if not texts:
+        return {"quote": "no_text", "missing_numbers": []}
+    full = _norm(" ".join(texts.values()))
+    res = {"quote": "no_quote", "missing_numbers": []}
+    q = c.get("quote")
+    if q:
+        nq = _norm(q)
+        if nq in full:
+            res["quote"] = "exact"
+        else:
+            # Допускаем только расхождения в пунктуации и пробелах: все слова цитаты должны
+            # стоять в источнике в том же порядке (подмена одного слова — уже не цитата).
+            words = re.findall(r"\w+", nq)
+            pat = r"\W+".join(re.escape(w) for w in words)
+            res["quote"] = "approx" if words and re.search(pat, full) else "not_found"
+    # Числа, посчитанные по таблице, в её тексте не встречаются — их проверяет скрипт в analysis/.
+    if all(sid in tables for sid in texts):
+        return res
+    src_nums = _numbers(full)
+    # Числа из утверждений, из которых выведено это, тоже считаются подтверждёнными.
+    allc = {x["id"]: x for x in read_jsonl(p.claims)}
+    for d in c.get("derived_from", []):
+        if d in allc:
+            src_nums |= _numbers(allc[d]["text"])
+    res["missing_numbers"] = sorted(n for n in _numbers(c["text"], claim=True)
+                                    if not _covered(n, src_nums))
+    return res
+
+
 def cmd_claim(a):
     p = P(project_dir(a.project))
     rows = read_jsonl(p.claims)
@@ -734,11 +833,24 @@ def cmd_claim(a):
             "confidence": a.conf, "question": a.q.upper() if a.q else None,
             "status": "active", "created": now(), "tags": split_ids(a.tags),
         }
+        if a.kind == "fact":
+            v = verify_claim(p, row)
+            if v["quote"] == "not_found":
+                die(f"цитата не найдена в тексте источника {', '.join(srcs)}. Скопируйте её "
+                    f"дословно из sources/text/ или уберите --quote и понизьте тип до hypothesis.")
+            row["verification"] = v
         rows.append(row)
         write_jsonl(p.claims, rows)
         journal(p, f"{cid} [{a.kind}] {a.text[:120]}", "claim")
         render_status(p)
         print(f"{cid}\t[{a.kind}] {a.text[:90]}")
+        v = row.get("verification") or {}
+        if v.get("missing_numbers"):
+            print(f"ВНИМ. Чисел {', '.join(v['missing_numbers'])} нет в тексте источника — "
+                  f"проверьте, не искажены ли они; расчёт оформляйте как forecast/hypothesis "
+                  f"с --derived или источником-расчётом из analysis/.")
+        if v.get("quote") == "no_quote":
+            print("ВНИМ. Факт без --quote: проверить его по источнику механически нельзя.")
     elif a.action == "retract":
         c = claim_ids.get(a.text.upper()) or die("нет такого утверждения")
         c["status"] = "retracted"
@@ -942,6 +1054,9 @@ def cmd_review(a):
 
 # ---------------------------------------------------------------- проверки и влияние
 
+HISTORY_RE = re.compile(r"~~|отозван|changelog", re.I)
+NUM_RE = re.compile(r"\d+(?:[,.]\d+)?\s*[–-]\s*\d+(?:[,.]\d+)?\s*(?:%|п\.п\.|₽|млн|млрд)"
+                    r"|\d+[,.]\d+\s*(?:%|п\.п\.)|\d{2,}\s*%")
 CITE_RE = re.compile(r"\[((?:[CSGDQ]\d{3})(?:\s*,\s*[CSGDQ]\d{3})*)\]")
 
 
@@ -976,7 +1091,16 @@ def collect_checks(p: P) -> tuple[list[str], list[str]]:
         for d in c.get("derived_from", []):
             if d in claims and claims[d]["status"] != "active":
                 warnings.append(f"{c['id']}: выведено из отозванного {d}")
+        if c["kind"] == "fact" and c["sources"]:
+            v = verify_claim(p, c)
+            if v["quote"] == "not_found":
+                problems.append(f"{c['id']}: цитата не найдена в источнике {', '.join(c['sources'])}")
+            if v["missing_numbers"]:
+                warnings.append(f"{c['id']}: чисел {', '.join(v['missing_numbers'])} нет в "
+                                f"источнике {', '.join(c['sources'])} — возможное искажение")
     for f in md_files(p):
+        if f.name in ("REPORT.md", "changelog.md"):  # собирается заново / хранит историю
+            continue
         text = f.read_text(encoding="utf-8")
         rel = f.relative_to(p.d)
         for ln, line in enumerate(text.splitlines(), 1):
@@ -987,7 +1111,9 @@ def collect_checks(p: P) -> tuple[list[str], list[str]]:
                         if not c:
                             problems.append(f"{rel}:{ln}: нет утверждения {ref}")
                         elif c["status"] != "active":
-                            problems.append(f"{rel}:{ln}: ссылка на отозванное {ref}")
+                            if not HISTORY_RE.search(line):
+                                problems.append(f"{rel}:{ln}: ссылка на отозванное {ref} "
+                                                f"(историческое упоминание пометьте «отозвано» или ~~…~~)")
                         elif c["kind"] == "synthetic" and re.search(
                                 r"доказ|подтвержд|спрос|большинств|\d+\s*%", line, re.I):
                             warnings.append(f"{rel}:{ln}: синтетика {ref} рядом с "
@@ -1007,6 +1133,33 @@ def collect_checks(p: P) -> tuple[list[str], list[str]]:
                 kind = "пробел" if row["id"].startswith("G") else "решение"
                 warnings.append(f"{row['id']}: {kind} ссылается на отозванное {ref} — "
                                 f"уточните через `pf.py {'gap' if kind == 'пробел' else 'decision'} edit`")
+    # Цифры из отозванных утверждений, оставшиеся в документах без ссылки, — частый остаток
+    # старой картины после пересмотра.
+    stale_nums = {}
+    for c in claims.values():
+        if c["status"] != "active":
+            for m in NUM_RE.findall(c["text"]):
+                stale_nums.setdefault(re.sub(r"\s+", "", m), c["id"])
+    for c in claims.values():  # цифра, которую подтверждает действующее утверждение, не устарела
+        if c["status"] == "active":
+            for m in NUM_RE.findall(c["text"]):
+                stale_nums.pop(re.sub(r"\s+", "", m), None)
+    if stale_nums:
+        for f in md_files(p):
+            if f.name in ("REPORT.md", "changelog.md"):
+                continue
+            for ln, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+                if HISTORY_RE.search(line):
+                    continue
+                for m in NUM_RE.findall(line):
+                    cid = stale_nums.get(re.sub(r"\s+", "", m))
+                    if cid:
+                        warnings.append(f"{f.relative_to(p.d)}:{ln}: «{m.strip()}» — цифра из "
+                                        f"отозванного {cid}; обновите или пометьте как прежнюю")
+    for f in sorted((p.d / "analysis").glob("*_result.md")):
+        if "устойчив" not in f.read_text(encoding="utf-8").lower():
+            warnings.append(f"{f.relative_to(p.d)}: нет раздела «Устойчивость» (меняется ли вывод при "
+                            f"сдвиге периодов, другой базе, других допущениях) — см. роль data-analyst")
     cited = set()
     for f in md_files(p):
         for grp in CITE_RE.findall(f.read_text(encoding="utf-8")):
@@ -1024,7 +1177,10 @@ def collect_checks(p: P) -> tuple[list[str], list[str]]:
                        ("deliverables/product_strategy.md", ["Аудитория", "Альтернатив", "Отказ"]),
                        ("deliverables/comms_strategy.md", ["Барьер", "Ключевое сообщение",
                                                            "Канал"]),
-                       ("deliverables/validation_plan.md", ["Сравн", "Срок", "Нежелательн"])]:
+                       ("deliverables/validation_plan.md", ["Сравн", "Срок", "Нежелательн"])] + (
+            [("deliverables/summary.md", ["Оставить как есть", "Возражени", "не обещаем",
+                                          "Сверка", "Сравн", "Нежелательн"])]
+            if (load_state(p).get("brief") or {}).get("depth") == "quick" else []):
         fp = p.d / name
         if fp.exists():
             t = fp.read_text(encoding="utf-8")
@@ -1391,11 +1547,13 @@ def kb_use(a, rows):
         kind = "fact"
         for s in e.get("sources") or []:
             got = (s.get("retrieved_at") or "")[:10]
+            # В снимок идёт только цитата из исходного источника, не текст утверждения: иначе
+            # сверка чисел и цитаты в новом проекте сравнивала бы факт сам с собой.
             row = register_source(
                 p, kind=s.get("kind") or "web", title=s.get("title") or e["text"][:60],
                 url=s.get("url"), path=s.get("path"),
                 text=f"Из базы знаний {e['id']} (проект {origin.get('project')}, {origin.get('ref')}).\n"
-                     f"{e['text']}\nЦитата: {e.get('quote') or '—'}\nМесто: {e.get('locator') or '—'}",
+                     f"Цитата: {e.get('quote') or '—'}\nМесто: {e.get('locator') or '—'}",
                 reliability=s.get("reliability"), published=s.get("published"),
                 origin=s.get("origin"), note=f"kb:{e['id']}; исходный источник получен {got or '?'}")
             srcs.append(row["id"])
@@ -1454,9 +1612,9 @@ def price_for(model: str, pricing: dict) -> dict:
 def transcript_dirs() -> list[Path]:
     base = Path.home() / ".claude" / "projects"
     enc = re.sub(r"[^A-Za-z0-9]", "-", str(ROOT))
-    # Сессия могла быть запущена из этой папки, вложенной или родительской (тогда фильтр по времени
-    # в cmd_cost отсекает работу до создания проекта).
-    return [d for d in base.glob("*") if d.is_dir() and (d.name.startswith(enc) or enc.startswith(d.name + "-"))] \
+    # Сессии агента запускаются из этой папки или вложенной. Родительскую не берём: там живут
+    # чужие сессии (например, разработка агента уровнем выше), и их ходы попали бы в расход проекта.
+    return [d for d in base.glob("*") if d.is_dir() and (d.name == enc or d.name.startswith(enc + "-"))] \
         if base.exists() else []
 
 
@@ -1669,7 +1827,41 @@ def cmd_hook(a):
 
 # ---------------------------------------------------------------- CLI
 
-def main():
+def cmd_batch(a):
+    """Выполнить много команд pf.py за один вызов: одна команда на строку, без 'python3 tools/pf.py'."""
+    import shlex
+    src = sys.stdin.read() if a.file == "-" else Path(a.file).read_text(encoding="utf-8")
+    ap = build_parser()
+    done = 0
+    for n, line in enumerate(src.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        args = shlex.split(line)
+        if args[:2] == ["python3", "tools/pf.py"]:
+            args = args[2:]
+        if args and args[0] == "batch":
+            die(f"строка {n}: вложенный batch не поддерживается")
+        if a.project and "--project" not in args and "-p" not in args:
+            args = ["--project", a.project] + args
+        print(f"> {line}")
+        try:
+            sub = ap.parse_args(args)
+            if sub.fn is cmd_fetch:  # загрузка не держит блокировку, как и вне batch
+                sub.fn(sub)
+            else:
+                with store_lock():
+                    sub.fn(sub)
+        except SystemExit as e:
+            if e.code not in (0, None):
+                print(f"Остановлено на строке {n} (выполнено команд: {done}). "
+                      f"Исправьте её и запустите оставшиеся строки.")
+                sys.exit(e.code)
+        done += 1
+    print(f"Выполнено команд: {done}")
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="pf", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--project", "-p", help="slug проекта (по умолчанию активный)")
@@ -1785,8 +1977,14 @@ def main():
     s = sp.add_parser("hook", help="(для хуков) session-start | stop")
     s.add_argument("event", choices=["session-start", "stop"]); s.set_defaults(fn=cmd_hook)
 
-    a = ap.parse_args()
-    if a.fn is cmd_fetch:  # блокирует сам, после загрузки
+    s = sp.add_parser("batch", help="выполнить команды pf.py из файла (по одной на строку; '-' — stdin)")
+    s.add_argument("file"); s.set_defaults(fn=cmd_batch)
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
+    if a.fn in (cmd_fetch, cmd_batch):  # блокируют сами: fetch — после загрузки, batch — по команде
         a.fn(a)
     else:
         with store_lock():
