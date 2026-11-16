@@ -172,6 +172,34 @@ class PfSmoke(unittest.TestCase):
         self.assertIn("взято из базы знаний K001", self.pf("check").stdout)
         self.assertIn("отозван", self.pf("kb", "use", "K001", ok=False).stderr)
 
+    def test_mcp_server_wraps_pf(self):
+        msgs = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "0"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "pf_claim_add", "arguments": {"text": "Рынок растёт", "kind": "fact"}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+             "params": {"name": "pf_claim_add",
+                        "arguments": {"text": "Рынок, вероятно, растёт", "kind": "hypothesis"}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+             "params": {"name": "pf", "arguments": {"args": ["claim", "list"]}}},
+        ]
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "mcp_server.py")], cwd=ROOT,
+                           env=self.env, input="\n".join(json.dumps(m) for m in msgs) + "\n",
+                           capture_output=True, text=True, encoding="utf-8", timeout=60)
+        out = {m["id"]: m for m in map(json.loads, r.stdout.splitlines())}
+        self.assertEqual(sorted(out), [1, 2, 3, 4, 5], "на уведомление отвечать нельзя")
+        self.assertEqual(out[1]["result"]["protocolVersion"], "2025-06-18")
+        names = {t["name"] for t in out[2]["result"]["tools"]}
+        self.assertTrue({"pf_status", "pf_claim_add", "pf_kb_search", "pf"} <= names)
+        self.assertTrue(out[3]["result"]["isError"], "факт без источника должен отклоняться и через MCP")
+        self.assertIn("факт без источника", out[3]["result"]["content"][0]["text"])
+        self.assertFalse(out[4]["result"]["isError"])
+        self.assertIn("Рынок, вероятно, растёт", out[5]["result"]["content"][0]["text"])
+
     def test_session_start_and_report(self):
         out = self.pf("hook", "session-start", stdin="{}").stdout
         self.assertIn("Следующее действие", out)
