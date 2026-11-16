@@ -634,9 +634,22 @@ def cmd_source(a):
                               url=a.url, text=a.text, reliability=a.reliability,
                               note=a.note, published=a.published, origin=a.origin)
         print(row["id"])
+    elif a.action == "reviewed":
+        # Человек/агент разобрал подозрительный фрагмент: флаг остаётся в истории,
+        # но утверждения из остальной части источника больше не помечаются.
+        rows = read_jsonl(p.sources)
+        r = next((r for r in rows if r["id"] == (a.id or "").upper()), None) or die("нет источника")
+        if not a.note:
+            die("укажите --note: что подозрительного и почему остальное можно использовать")
+        r["injection_review"] = {"at": now(), "note": a.note}
+        write_jsonl(p.sources, rows)
+        journal(p, f"Источник {r['id']}: подозрительное содержимое разобрано — {a.note}", "source")
+        print(f"{r['id']}: отмечено как разобранное")
     elif a.action == "list":
         for r in read_jsonl(p.sources):
             fl = (" ⚠" + ",".join(r["flags"])) if r.get("flags") else ""
+            if r.get("injection_review"):
+                fl += " (разобрано)"
             print(f"{r['id']}\t{r['kind']}\t{r.get('reliability') or '-'}\t"
                   f"{r['title'][:70]}\t{r.get('url') or r.get('path') or ''}{fl}")
 
@@ -890,7 +903,8 @@ def cmd_check(a):
         for sid in c["sources"]:
             if sid not in srcs:
                 problems.append(f"{c['id']}: ссылка на несуществующий источник {sid}")
-            elif "possible_prompt_injection" in (srcs[sid].get("flags") or []):
+            elif "possible_prompt_injection" in (srcs[sid].get("flags") or []) and \
+                    not srcs[sid].get("injection_review"):
                 warnings.append(f"{c['id']}: опирается на источник {sid} с подозрительным содержимым")
         if c["kind"] == "fact" and any(srcs.get(s, {}).get("kind") == "synthetic"
                                        for s in c["sources"]):
@@ -1294,8 +1308,9 @@ def main():
     s = sp.add_parser("ingest", help="зарегистрировать локальный файл или папку")
     s.add_argument("path"); s.add_argument("--kind"); src_opts(s); s.set_defaults(fn=cmd_ingest)
 
-    s = sp.add_parser("source", help="источники: add (заметка/интервью/результат поиска) | list")
-    s.add_argument("action", choices=["add", "list"]); s.add_argument("--url"); s.add_argument("--text")
+    s = sp.add_parser("source", help="источники: add (заметка/интервью/результат поиска) | list | reviewed (подозрительное содержимое разобрано)")
+    s.add_argument("action", choices=["add", "list", "reviewed"]); s.add_argument("--url"); s.add_argument("--text")
+    s.add_argument("--id", help="reviewed: ID источника")
     s.add_argument("--kind", choices=["web", "document", "table", "interview", "synthetic",
                                       "image", "analysis", "note", "human"])
     src_opts(s); s.set_defaults(fn=cmd_source)
