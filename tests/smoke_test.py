@@ -108,6 +108,33 @@ class PfSmoke(unittest.TestCase):
         self.assertIn("D001", imp)
         self.assertIn("D001", self.pf("review").stdout)
 
+    def test_batch_with_fetch_does_not_deadlock(self):
+        page = Path(self.tmp.name) / "page.html"
+        page.write_text("<html><body>Цена 499 руб.</body></html>", encoding="utf-8")
+        batch = Path(self.tmp.name) / "batch.txt"
+        batch.write_text(f"fetch {page.as_uri()}\nsource add --kind note --text x\n", encoding="utf-8")
+        r = subprocess.run([sys.executable, str(PF), "batch", str(batch)], cwd=ROOT, env=self.env,
+                           capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Выполнено команд: 2", r.stdout)
+
+    def test_cost_ignores_sessions_of_parent_folder(self):
+        home = Path(self.tmp.name) / "home"
+        enc = "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in str(ROOT))
+        parent = "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in str(ROOT.parent))
+        row = {"timestamp": "2099-01-01T00:00:00", "message": {
+            "id": "", "model": "claude-sonnet-5-5", "usage": {"input_tokens": 0, "output_tokens": 1_000_000}}}
+        for name, mid in ((enc, "own"), (parent, "parent")):
+            d = home / ".claude" / "projects" / name
+            d.mkdir(parents=True)
+            (d / "s.jsonl").write_text(json.dumps({**row, "message": {**row["message"], "id": mid}}),
+                                       encoding="utf-8")
+        r = subprocess.run([sys.executable, str(PF), "cost"], cwd=ROOT, capture_output=True,
+                           env={**self.env, "HOME": str(home), "USERPROFILE": str(home)},
+                           text=True, encoding="utf-8")
+        line = next(x for x in r.stdout.splitlines() if x.startswith("claude-sonnet"))
+        self.assertEqual(line.split()[1], "1", "сессия родительской папки попала в расход проекта")
+
     def test_session_start_and_report(self):
         out = self.pf("hook", "session-start", stdin="{}").stdout
         self.assertIn("Следующее действие", out)
