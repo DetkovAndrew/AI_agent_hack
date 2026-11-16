@@ -879,6 +879,9 @@ def cmd_review(a):
 
 # ---------------------------------------------------------------- проверки и влияние
 
+HISTORY_RE = re.compile(r"~~|отозван|changelog", re.I)
+NUM_RE = re.compile(r"\d+(?:[,.]\d+)?\s*[–-]\s*\d+(?:[,.]\d+)?\s*(?:%|п\.п\.|₽|млн|млрд)"
+                    r"|\d+[,.]\d+\s*(?:%|п\.п\.)|\d{2,}\s*%")
 CITE_RE = re.compile(r"\[((?:[CSGDQ]\d{3})(?:\s*,\s*[CSGDQ]\d{3})*)\]")
 
 
@@ -914,6 +917,8 @@ def cmd_check(a):
             if d in claims and claims[d]["status"] != "active":
                 warnings.append(f"{c['id']}: выведено из отозванного {d}")
     for f in md_files(p):
+        if f.name in ("REPORT.md", "changelog.md"):  # собирается заново / хранит историю
+            continue
         text = f.read_text(encoding="utf-8")
         rel = f.relative_to(p.d)
         for ln, line in enumerate(text.splitlines(), 1):
@@ -924,7 +929,9 @@ def cmd_check(a):
                         if not c:
                             problems.append(f"{rel}:{ln}: нет утверждения {ref}")
                         elif c["status"] != "active":
-                            problems.append(f"{rel}:{ln}: ссылка на отозванное {ref}")
+                            if not HISTORY_RE.search(line):
+                                problems.append(f"{rel}:{ln}: ссылка на отозванное {ref} "
+                                                f"(историческое упоминание пометьте «отозвано» или ~~…~~)")
                         elif c["kind"] == "synthetic" and re.search(
                                 r"доказ|подтвержд|спрос|большинств|\d+\s*%", line, re.I):
                             warnings.append(f"{rel}:{ln}: синтетика {ref} рядом с "
@@ -944,6 +951,29 @@ def cmd_check(a):
                 kind = "пробел" if row["id"].startswith("G") else "решение"
                 warnings.append(f"{row['id']}: {kind} ссылается на отозванное {ref} — "
                                 f"уточните через `pf.py {'gap' if kind == 'пробел' else 'decision'} edit`")
+    # Цифры из отозванных утверждений, оставшиеся в документах без ссылки, — частый остаток
+    # старой картины после пересмотра.
+    stale_nums = {}
+    for c in claims.values():
+        if c["status"] != "active":
+            for m in NUM_RE.findall(c["text"]):
+                stale_nums.setdefault(re.sub(r"\s+", "", m), c["id"])
+    for c in claims.values():  # цифра, которую подтверждает действующее утверждение, не устарела
+        if c["status"] == "active":
+            for m in NUM_RE.findall(c["text"]):
+                stale_nums.pop(re.sub(r"\s+", "", m), None)
+    if stale_nums:
+        for f in md_files(p):
+            if f.name in ("REPORT.md", "changelog.md"):
+                continue
+            for ln, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+                if HISTORY_RE.search(line):
+                    continue
+                for m in NUM_RE.findall(line):
+                    cid = stale_nums.get(re.sub(r"\s+", "", m))
+                    if cid:
+                        warnings.append(f"{f.relative_to(p.d)}:{ln}: «{m.strip()}» — цифра из "
+                                        f"отозванного {cid}; обновите или пометьте как прежнюю")
     cited = set()
     for f in md_files(p):
         for grp in CITE_RE.findall(f.read_text(encoding="utf-8")):
