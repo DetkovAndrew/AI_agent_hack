@@ -961,7 +961,10 @@ def cmd_check(a):
                        ("deliverables/product_strategy.md", ["Аудитория", "Альтернатив", "Отказ"]),
                        ("deliverables/comms_strategy.md", ["Барьер", "Ключевое сообщение",
                                                            "Канал"]),
-                       ("deliverables/validation_plan.md", ["Сравн", "Срок", "Нежелательн"])]:
+                       ("deliverables/validation_plan.md", ["Сравн", "Срок", "Нежелательн"])] + (
+            [("deliverables/summary.md", ["Оставить как есть", "Возражени", "не обещаем",
+                                          "Сверка", "Сравн", "Нежелательн"])]
+            if (load_state(p).get("brief") or {}).get("depth") == "quick" else []):
         fp = p.d / name
         if fp.exists():
             t = fp.read_text(encoding="utf-8")
@@ -1266,7 +1269,37 @@ def cmd_hook(a):
 
 # ---------------------------------------------------------------- CLI
 
-def main():
+def cmd_batch(a):
+    """Выполнить много команд pf.py за один вызов: одна команда на строку, без 'python3 tools/pf.py'."""
+    import shlex
+    src = sys.stdin.read() if a.file == "-" else Path(a.file).read_text(encoding="utf-8")
+    ap = build_parser()
+    done = 0
+    for n, line in enumerate(src.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        args = shlex.split(line)
+        if args[:2] == ["python3", "tools/pf.py"]:
+            args = args[2:]
+        if args and args[0] == "batch":
+            die(f"строка {n}: вложенный batch не поддерживается")
+        if a.project and "--project" not in args and "-p" not in args:
+            args = ["--project", a.project] + args
+        print(f"> {line}")
+        try:
+            sub = ap.parse_args(args)
+            sub.fn(sub)
+        except SystemExit as e:
+            if e.code not in (0, None):
+                print(f"Остановлено на строке {n} (выполнено команд: {done}). "
+                      f"Исправьте её и запустите оставшиеся строки.")
+                sys.exit(e.code)
+        done += 1
+    print(f"Выполнено команд: {done}")
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="pf", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--project", "-p", help="slug проекта (по умолчанию активный)")
@@ -1370,7 +1403,13 @@ def main():
     s = sp.add_parser("hook", help="(для хуков) session-start | stop")
     s.add_argument("event", choices=["session-start", "stop"]); s.set_defaults(fn=cmd_hook)
 
-    a = ap.parse_args()
+    s = sp.add_parser("batch", help="выполнить команды pf.py из файла (по одной на строку; '-' — stdin)")
+    s.add_argument("file"); s.set_defaults(fn=cmd_batch)
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
     a.fn(a)
 
 
