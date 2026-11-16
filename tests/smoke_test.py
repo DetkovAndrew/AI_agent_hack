@@ -108,6 +108,70 @@ class PfSmoke(unittest.TestCase):
         self.assertIn("D001", imp)
         self.assertIn("D001", self.pf("review").stdout)
 
+    # ---- база знаний между проектами
+
+    def kb_id(self, out):
+        return out.split()[0]
+
+    def test_kb_fact_keeps_source_lesson_never_becomes_fact(self):
+        self.pf("set", "brief.allowed_sources", "open-web", "--append")
+        sid = self.pf("source", "add", "--kind", "web", "--url", "https://example.org/report",
+                      "--title", "Отчёт", "--text", "Удержание за 2025 год — 31%").stdout.split()[-1]
+        self.pf("claim", "add", "Удержание через 30 дней в 2025 году — 31%", "--kind", "fact",
+                "--src", sid, "--quote", "Удержание за 2025 год — 31%", "--tags", "retention")
+        self.pf("claim", "add", "Удержание падает из-за онбординга", "--kind", "hypothesis")
+        k_fact = self.kb_id(self.pf("kb", "promote", "C001").stdout)
+        k_less = self.kb_id(self.pf("kb", "promote", "C002").stdout)
+        listing = self.pf("kb", "list").stdout
+        self.assertIn(f"{k_fact}  [факт с источником]", listing)
+        self.assertIn(f"{k_less}  [вывод агента — не факт]", listing)
+        self.assertIn("https://example.org/report", self.pf("kb", "show", k_fact).stdout)
+
+        # Новый проект: факт возвращается со своим источником, вывод агента — только гипотезой.
+        self.pf("init", "next", "--title", "Второй проект")
+        out = self.pf("kb", "use", k_fact).stdout
+        self.assertIn("[fact]", out)
+        self.pf("kb", "use", k_less)
+        nxt = [json.loads(x) for x in (Path(self.tmp.name) / "next/evidence/claims.jsonl")
+               .read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([c["kind"] for c in nxt], ["fact", "hypothesis"])
+        self.assertTrue(nxt[0]["sources"])
+        self.assertEqual(nxt[1]["sources"], [])
+        reg = (Path(self.tmp.name) / "next/sources/registry.jsonl").read_text(encoding="utf-8")
+        self.assertIn("https://example.org/report", reg)
+        # повтор не дублирует
+        self.assertIn("Уже в проекте", self.pf("kb", "use", k_fact).stdout)
+
+    def test_kb_refuses_unsourced_facts_and_synthetic(self):
+        r = self.pf("kb", "add", "Рынок вырос на 20%", "--kind", "fact", ok=False)
+        self.assertIn("kb promote", r.stderr)
+        sid = self.add_source("Респондент: удобно", kind="synthetic")
+        self.pf("claim", "add", "Персоне удобно", "--kind", "synthetic", "--src", sid)
+        r = self.pf("kb", "promote", "C001", ok=False)
+        self.assertIn("синтетика", r.stderr)
+
+    def test_kb_search_handles_morphology_and_hides_retracted(self):
+        self.pf("kb", "add", "Онбординг на Android теряет пользователей на шаге СМС",
+                "--kind", "lesson", "--tags", "onboarding,android")
+        self.pf("kb", "add", "PM предпочитает пилоты не дольше 6 недель", "--kind", "note")
+        self.pf("kb", "add", "Цены конкурентов в travel-eSIM меняются ежемесячно", "--kind", "lesson")
+        out = self.pf("kb", "search", "онбординге андроида потеря пользователя").stdout
+        self.assertTrue(out.startswith("K001"), out)
+        self.pf("kb", "add", "Онбординг теряет пользователей на шаге выбора тарифа",
+                "--kind", "lesson", "--links", "K001")
+        self.pf("kb", "supersede", "K001", "--by", "K004", "--reason", "СМС починили, узкое место сместилось")
+        out = self.pf("kb", "search", "онбординг пользователи").stdout
+        self.assertNotIn("K001", out.split("(скрыто")[0])
+        self.assertIn("скрыто", out)
+        self.assertIn("K001", self.pf("kb", "related", "K004").stdout)
+
+    def test_kb_retraction_reaches_projects_that_used_it(self):
+        self.pf("kb", "add", "Аудитория сервиса — в основном студенты", "--kind", "lesson")
+        self.pf("kb", "use", "K001")
+        self.pf("kb", "retract", "K001", "--reason", "опрос показал обратное")
+        self.assertIn("взято из базы знаний K001", self.pf("check").stdout)
+        self.assertIn("отозван", self.pf("kb", "use", "K001", ok=False).stderr)
+
     def test_session_start_and_report(self):
         out = self.pf("hook", "session-start", stdin="{}").stdout
         self.assertIn("Следующее действие", out)
