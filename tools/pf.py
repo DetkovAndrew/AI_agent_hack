@@ -620,7 +620,8 @@ def cmd_ingest(a):
             rel = str(f.relative_to(ROOT))
         except ValueError:
             rel = str(f)
-        row = register_source(p, kind=a.kind or "document", title=a.title or f.name,
+        auto = "table" if f.suffix.lower() in {".csv", ".tsv", ".xlsx", ".xls"} else "document"
+        row = register_source(p, kind=a.kind or auto, title=a.title or f.name,
                               path=rel, text=text, raw_bytes=data, ext=f.suffix.lower(),
                               reliability=a.reliability, note=a.note,
                               published=a.published, origin=a.origin)
@@ -656,6 +657,87 @@ def cmd_source(a):
 
 # ---------------------------------------------------------------- утверждения
 
+def _norm(t: str) -> str:
+    t = t.lower().replace("ё", "е").replace("\u00ad", "")
+    t = re.sub(r"[\u2010-\u2015\u2212]", "-", t)
+    t = re.sub(r"[«»“”„\"'’`]", "", t)
+    t = re.sub(r"(?<=\d)[\s\u00a0\u202f](?=\d{3}\b)", "", t)  # 2 000 → 2000
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _numbers(t: str, claim: bool = False) -> set[str]:
+    """Значимые числа: от двух цифр или дробные (одиночные цифры слишком неспецифичны).
+    В тексте утверждения (русский) дробная часть — через запятую, а «07.09» — дата: её и годы
+    не сверяем, ID вида S001 выбрасываем."""
+    t = re.sub(r"\b[CSGDQ]\d{3}\b", " ", _norm(t), flags=re.I)
+    if claim:
+        t = re.sub(r"\b\d{1,2}\.\d{1,2}(?:\.\d{2,4})?\b", " ", t)
+        t = re.sub(r"\b(?:19|20)\d{2}\b", " ", t)
+    out = set()
+    for m in re.findall(r"\d+(?:[.,]\d+)?", t):
+        m = m.replace(",", ".")
+        if len(m.replace(".", "")) >= 2:
+            out.add(m)
+    return out
+
+
+def _covered(n: str, pool: set[str]) -> bool:
+    """Число есть в источнике — точно или как округление более точного значения."""
+    if n in pool:
+        return True
+    dec = len(n.split(".")[1]) if "." in n else 0
+    x = float(n)
+    tol = 0.5 * 10 ** -dec + 1e-9
+    return any("." in y and len(y.split(".")[1]) > dec and abs(float(y) - x) <= tol for y in pool)
+
+
+def source_texts(p: P, sids: list[str]) -> dict[str, str]:
+    srcs = {s["id"]: s for s in read_jsonl(p.sources)}
+    out = {}
+    for sid in sids:
+        s = srcs.get(sid) or {}
+        if s.get("text") and (p.d / s["text"]).exists():
+            out[sid] = (p.d / s["text"]).read_text(encoding="utf-8", errors="ignore")
+    return out
+
+
+def verify_claim(p: P, c: dict) -> dict:
+    """Механическая сверка факта со снимками источников: есть ли там цитата и числа из текста.
+    Ловит пересказ «по памяти» и искажённые цифры без участия модели."""
+    srows = read_jsonl(p.sources)
+    kinds = {s["id"]: s.get("kind") for s in srows}
+    tables = {s["id"] for s in srows if s.get("kind") == "table" or
+              str(s.get("path") or s.get("raw") or "").lower().endswith((".csv", ".tsv", ".xlsx", ".xls"))}
+    texts = source_texts(p, c.get("sources", []))
+    if not texts:
+        return {"quote": "no_text", "missing_numbers": []}
+    full = _norm(" ".join(texts.values()))
+    res = {"quote": "no_quote", "missing_numbers": []}
+    q = c.get("quote")
+    if q:
+        nq = _norm(q)
+        if nq in full:
+            res["quote"] = "exact"
+        else:
+            # Допускаем только расхождения в пунктуации и пробелах: все слова цитаты должны
+            # стоять в источнике в том же порядке (подмена одного слова — уже не цитата).
+            words = re.findall(r"\w+", nq)
+            pat = r"\W+".join(re.escape(w) for w in words)
+            res["quote"] = "approx" if words and re.search(pat, full) else "not_found"
+    # Числа, посчитанные по таблице, в её тексте не встречаются — их проверяет скрипт в analysis/.
+    if all(sid in tables for sid in texts):
+        return res
+    src_nums = _numbers(full)
+    # Числа из утверждений, из которых выведено это, тоже считаются подтверждёнными.
+    allc = {x["id"]: x for x in read_jsonl(p.claims)}
+    for d in c.get("derived_from", []):
+        if d in allc:
+            src_nums |= _numbers(allc[d]["text"])
+    res["missing_numbers"] = sorted(n for n in _numbers(c["text"], claim=True)
+                                    if not _covered(n, src_nums))
+    return res
+
+
 def cmd_claim(a):
     p = P(project_dir(a.project))
     rows = read_jsonl(p.claims)
@@ -683,11 +765,24 @@ def cmd_claim(a):
             "confidence": a.conf, "question": a.q.upper() if a.q else None,
             "status": "active", "created": now(), "tags": split_ids(a.tags),
         }
+        if a.kind == "fact":
+            v = verify_claim(p, row)
+            if v["quote"] == "not_found":
+                die(f"цитата не найдена в тексте источника {', '.join(srcs)}. Скопируйте её "
+                    f"дословно из sources/text/ или уберите --quote и понизьте тип до hypothesis.")
+            row["verification"] = v
         rows.append(row)
         write_jsonl(p.claims, rows)
         journal(p, f"{cid} [{a.kind}] {a.text[:120]}", "claim")
         render_status(p)
         print(f"{cid}\t[{a.kind}] {a.text[:90]}")
+        v = row.get("verification") or {}
+        if v.get("missing_numbers"):
+            print(f"ВНИМ. Чисел {', '.join(v['missing_numbers'])} нет в тексте источника — "
+                  f"проверьте, не искажены ли они; расчёт оформляйте как forecast/hypothesis "
+                  f"с --derived или источником-расчётом из analysis/.")
+        if v.get("quote") == "no_quote":
+            print("ВНИМ. Факт без --quote: проверить его по источнику механически нельзя.")
     elif a.action == "retract":
         c = claim_ids.get(a.text.upper()) or die("нет такого утверждения")
         c["status"] = "retracted"
@@ -916,6 +1011,13 @@ def cmd_check(a):
         for d in c.get("derived_from", []):
             if d in claims and claims[d]["status"] != "active":
                 warnings.append(f"{c['id']}: выведено из отозванного {d}")
+        if c["kind"] == "fact" and c["sources"]:
+            v = verify_claim(p, c)
+            if v["quote"] == "not_found":
+                problems.append(f"{c['id']}: цитата не найдена в источнике {', '.join(c['sources'])}")
+            if v["missing_numbers"]:
+                warnings.append(f"{c['id']}: чисел {', '.join(v['missing_numbers'])} нет в "
+                                f"источнике {', '.join(c['sources'])} — возможное искажение")
     for f in md_files(p):
         if f.name in ("REPORT.md", "changelog.md"):  # собирается заново / хранит историю
             continue
