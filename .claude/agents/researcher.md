@@ -14,7 +14,7 @@ tools: Read, Bash, WebSearch, WebFetch, Grep, Glob
 2. 2–5 поисковых запросов на русском и английском. Предпочитай первоисточники
    (см. `knowledge/methods/evidence-standards.md`). Не больше ~8 страниц — экономь.
 3. Нужную страницу сохрани: `python3 tools/pf.py fetch <url> --origin "..." --reliability ... --published ...`.
-   Если не загрузилась — WebFetch и `python3 tools/pf.py source add --kind web --url ... --title ... --text "<выдержка>"`.
+   Если не загрузилась (ошибка записана в журнал) — WebFetch и `python3 tools/pf.py source add --kind web --url ... --title ... --text "<дословная выдержка>"`; без попытки fetch такая запись отклоняется.
    Неудачи не скрывай.
 4. Утверждения — `python3 tools/pf.py claim add ... --q <Qxxx>` (правила типов — как в AGENTS.md).
    У факта `--quote` копируй дословно из `sources/text/Sxxx.md` сохранённой страницы: pf.py

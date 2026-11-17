@@ -46,6 +46,11 @@ def main():
            "--quote", "Цена 299 рублей в месяц", ok=False, expect="цитата не найдена")
         pf("claim", "add", "Цена 299 ₽/мес", "--kind", "fact", "--src", "S001",
            expect="Чисел 299 нет")
+        pf("source", "add", "--kind", "web", "--url", "https://example.invalid/x",
+           "--text", "вставленный текст", ok=False, expect="сначала скачайте")
+        pf("source", "add", "--kind", "web", "--title", "Сводка поиска", "--text", "цена 777 рублей")
+        pf("claim", "add", "Цена 777", "--kind", "fact", "--src", "S002",
+           "--quote", "цена 777 рублей", ok=False, expect="сводка поиска без URL")
         pf("claim", "add", "Подписку купят 5% клиентов", "--kind", "assumption", "--tags", "G001")
         pf("gap", "add", "Доля покупателей", "--why", "нет данных", "--how", "тест",
            "--impact", "high")

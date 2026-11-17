@@ -631,6 +631,14 @@ def cmd_ingest(a):
 def cmd_source(a):
     p = P(project_dir(a.project))
     if a.action == "add":
+        if (a.kind or "note") == "web" and a.url and a.text:
+            # Текст страницы, вставленный агентом, нельзя сверить со страницей: цитата совпадёт
+            # с тем, что модель сама написала. Поэтому сначала — попытка скачать снимок.
+            log = p.journal.read_text(encoding="utf-8") if p.journal.exists() else ""
+            if f"НЕ УДАЛОСЬ загрузить {a.url}" not in log:
+                die(f"сначала скачайте страницу: pf.py fetch {a.url}. Выдержку вручную можно "
+                    f"записать, только если fetch не сработал (ошибка попадёт в журнал); "
+                    f"вставляйте её дословно из WebFetch, без пересказа.")
         row = register_source(p, kind=a.kind or "note", title=a.title or a.url or "без названия",
                               url=a.url, text=a.text, reliability=a.reliability,
                               note=a.note, published=a.published, origin=a.origin)
@@ -701,6 +709,16 @@ def source_texts(p: P, sids: list[str]) -> dict[str, str]:
     return out
 
 
+def provenance(s: dict) -> str:
+    """fetched — снимок скачан pf.py; file — файл PM; excerpt — веб-текст вставлен агентом;
+    search — сводка поиска без URL; human — слова PM/интервью."""
+    if s.get("kind") == "web":
+        if s.get("raw"):
+            return "fetched"
+        return "excerpt" if s.get("url") else "search"
+    return "file" if s.get("raw") else "human"
+
+
 def verify_claim(p: P, c: dict) -> dict:
     """Механическая сверка факта со снимками источников: есть ли там цитата и числа из текста.
     Ловит пересказ «по памяти» и искажённые цифры без участия модели."""
@@ -713,6 +731,9 @@ def verify_claim(p: P, c: dict) -> dict:
         return {"quote": "no_text", "missing_numbers": []}
     full = _norm(" ".join(texts.values()))
     res = {"quote": "no_quote", "missing_numbers": []}
+    prov = {provenance(x) for x in srows if x["id"] in texts}
+    if prov and prov <= {"excerpt", "search"}:
+        res["provenance"] = "excerpt"
     q = c.get("quote")
     if q:
         nq = _norm(q)
@@ -766,6 +787,11 @@ def cmd_claim(a):
             "status": "active", "created": now(), "tags": split_ids(a.tags),
         }
         if a.kind == "fact":
+            srows = {x["id"]: x for x in read_jsonl(p.sources)}
+            search = [sid for sid in srcs if provenance(srows[sid]) == "search"]
+            if search:
+                die(f"{', '.join(search)} — сводка поиска без URL: на ней не может стоять факт. "
+                    f"Найдите страницу и скачайте её (pf.py fetch) или оформите как hypothesis.")
             v = verify_claim(p, row)
             if v["quote"] == "not_found":
                 die(f"цитата не найдена в тексте источника {', '.join(srcs)}. Скопируйте её "
@@ -783,6 +809,9 @@ def cmd_claim(a):
                   f"с --derived или источником-расчётом из analysis/.")
         if v.get("quote") == "no_quote":
             print("ВНИМ. Факт без --quote: проверить его по источнику механически нельзя.")
+        if v.get("provenance") == "excerpt":
+            print("ВНИМ. Факт опирается только на выдержку, вставленную вручную, а не на скачанную "
+                  "страницу: цитата сверена с выдержкой. В документе пометьте «по выдержке».")
     elif a.action == "retract":
         c = claim_ids.get(a.text.upper()) or die("нет такого утверждения")
         c["status"] = "retracted"
@@ -1015,6 +1044,9 @@ def cmd_check(a):
             v = verify_claim(p, c)
             if v["quote"] == "not_found":
                 problems.append(f"{c['id']}: цитата не найдена в источнике {', '.join(c['sources'])}")
+            if v.get("provenance") == "excerpt":
+                warnings.append(f"{c['id']}: факт стоит только на выдержке без снимка страницы "
+                                f"({', '.join(c['sources'])}) — сверка цитаты условна")
             if v["missing_numbers"]:
                 warnings.append(f"{c['id']}: чисел {', '.join(v['missing_numbers'])} нет в "
                                 f"источнике {', '.join(c['sources'])} — возможное искажение")
@@ -1109,9 +1141,16 @@ def cmd_check(a):
                     warnings.append(f"{name}: не найден обязательный раздел «{n}…»")
             if not CITE_RE.search(t):
                 warnings.append(f"{name}: нет ни одной ссылки на утверждения [Cxxx]")
-    if (p.d / "deliverables/comms_strategy.md").exists() and not any(
+    quick_sum = (load_state(p).get("brief") or {}).get("depth") == "quick" and \
+        (p.d / "deliverables/summary.md").exists()
+    titles = " ".join((x.get("title") or "").lower() for x in srcs.values())
+    if (quick_sum or (p.d / "deliverables/options.md").exists()) and "red-team" not in titles:
+        warnings.append("нет возражений red-team к вариантам — запустите субагента red-team и "
+                        "зарегистрируйте ответ: pf.py source add --kind analysis --title "
+                        "\"Возражения red-team: ...\" --text \"...\"")
+    if (quick_sum or (p.d / "deliverables/comms_strategy.md").exists()) and not any(
             "judge" in (x.get("title") or "").lower() for x in srcs.values()):
-        warnings.append("comms_strategy.md: нет независимой сверки обещаний — запустите субагента "
+        warnings.append("нет независимой сверки обещаний — запустите субагента "
                         "judge и зарегистрируйте вердикты: pf.py source add --kind analysis "
                         "--title \"Вердикты judge: обещания vs продукт\" --text \"...\"")
     if a.quiet and not problems and not warnings:
