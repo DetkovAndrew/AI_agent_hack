@@ -675,6 +675,12 @@ def cmd_fetch(a):
     fl = f", ⚠ {','.join(row['flags'])}" if row.get("flags") else ""
     print(f"{row['id']}\t{row['title'][:80]}\t{row.get('chars', 0)} симв.\t"
           f"дата: {row.get('published') or '—'}\t{row.get('text')}{fl}")
+    open_q = [q for q in (st.get("key_questions") or []) if q.get("status", "open") == "open"]
+    if open_q:
+        print(f"Из {row['id']} выпиши ВСЕ факты по открытым вопросам (обычно 2–5, с цитатами из "
+              f"{row.get('text')}):")
+        for q in open_q:
+            print(f"  {q['id']} {q['text']}")
     if not row.get("published"):
         print("ВНИМ. Дата публикации не найдена на странице — укажите её: "
               f"pf.py source date --id {row['id']} --published ГГГГ-ММ-ДД (свежесть данных).")
@@ -1062,7 +1068,11 @@ def breadth(p: P) -> str:
 
 
 def in_claude_code() -> bool:
-    """Агент работает в Claude Code (там есть субагенты); в Codex/Cursor — нет."""
+    """Агент работает в Claude Code (там есть субагенты); в Codex/Cursor/Gemini — нет.
+    PF_AGENT_ENV явно задаёт среду (codex, cursor, gemini), если её нельзя определить сама."""
+    env = os.environ.get("PF_AGENT_ENV")
+    if env:
+        return env.lower() in ("claude", "claude-code")
     return bool(os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_SESSION_ID"))
 
 
@@ -1628,7 +1638,7 @@ def collect_checks(p: P, release: bool = False) -> tuple[list[str], list[str]]:
                           f"дальше (из каждого поиска скачивайте 2–3 лучших результата) или "
                           f"объясните пробелом с --searched, что искали и не нашли")
         if fetched and len(facts) < len(fetched) * per_page:
-            warnings.append(f"ширина «{lvl}»: фактов {len(facts)} на {len(fetched)} скачанных страниц — "
+            strict.append(f"ширина «{lvl}»: фактов {len(facts)} на {len(fetched)} скачанных страниц — "
                             f"со страниц взято мало; берите все факты, относящиеся к ключевым вопросам")
         unused = [x["id"] for x in fetched if x.get("chars", 0) > 2000 and
                   not any(x["id"] in c["sources"] for c in claims.values())]
