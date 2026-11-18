@@ -116,6 +116,9 @@ def main():
         sm.write_text(sm.read_text(encoding="utf-8").replace(
             "- Пункт без всякой ссылки на реестр утверждений.\n", ""), encoding="utf-8")
         pf("check", "--release", expect="judge: deliverables/summary.md изменён после проверки")
+        pf("verdict", "diff", "--role", "fidelity", "--target", "deliverables/summary.md",
+           expect="удалённых 1")
+        pf("digest", expect="## Ключевые вопросы")
         for role in ("judge", "fidelity"):
             pf("verdict", "add", "--role", role, "--target", "deliverables/summary.md",
                "--text", "проверено повторно", "--executor", "subagent")

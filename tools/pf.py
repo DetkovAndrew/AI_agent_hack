@@ -665,8 +665,9 @@ def cmd_fetch(a):
                               raw_bytes=data, ext=ext, reliability=a.reliability,
                               note=a.note, published=published, origin=a.origin,
                               retells=a.retells)
-    print(json.dumps({k: row.get(k) for k in ("id", "title", "text", "chars", "flags", "published")},
-                     ensure_ascii=False))
+    fl = f", ⚠ {','.join(row['flags'])}" if row.get("flags") else ""
+    print(f"{row['id']}\t{row['title'][:80]}\t{row.get('chars', 0)} симв.\t"
+          f"дата: {row.get('published') or '—'}\t{row.get('text')}{fl}")
     if not row.get("published"):
         print("ВНИМ. Дата публикации не найдена на странице — укажите её: "
               f"pf.py source date --id {row['id']} --published ГГГГ-ММ-ДД (свежесть данных).")
@@ -1061,18 +1062,95 @@ def cmd_verdict(a):
         st = load_state(p)
         executor = a.executor or ("subagent" if subagent_ran(a.role, st.get("created", "")) else "self")
         vid = next_id(rows, "V")
+        snap = verdicts_path(p).parent / "verdicts" / f"{vid}.md"
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        snap.write_text((p.d / tgt).read_text(encoding="utf-8"), encoding="utf-8")
         rows.append({"id": vid, "role": a.role, "target": tgt, "sha": sha, "at": now(),
-                     "executor": executor, "text": a.text})
+                     "executor": executor, "text": a.text,
+                     "snapshot": str(snap.relative_to(p.d))})
         write_jsonl(verdicts_path(p), rows)
         journal(p, f"Проверка {vid} ({a.role}, {executor}) по {tgt}", "verdict")
         print(f"{vid}\t{a.role}\t{tgt}\tисполнитель: {executor}")
         if executor == "self":
             print("ВНИМ. Проверку выполнил сам автор документа — в Claude Code запускайте субагента "
                   f"{a.role}; в других средах — отдельным проходом «со стороны».")
+    elif a.action == "diff":
+        # Что изменилось в документе после последней проверки этой роли — повторную проверку
+        # достаточно провести только по этим строкам.
+        import difflib
+        tgt = (a.target or "").replace("\\", "/")
+        mine = [v for v in rows if v["role"] == a.role and v["target"] == tgt]
+        if not mine:
+            die(f"проверок {a.role} по {tgt} ещё не было — проверьте весь документ")
+        last = mine[-1]
+        snap = p.d / last.get("snapshot", "")
+        if not last.get("snapshot") or not snap.exists():
+            die(f"у {last['id']} нет снимка текста — проверьте весь документ")
+        old = snap.read_text(encoding="utf-8").splitlines()
+        new = (p.d / tgt).read_text(encoding="utf-8").splitlines()
+        diff = [ln for ln in difflib.ndiff(old, new) if ln[:2] in ("+ ", "- ")]
+        if not diff:
+            print(f"{tgt} не изменился после {last['id']} — повторная проверка не нужна")
+        else:
+            added = [ln[2:] for ln in diff if ln.startswith("+ ") and ln[2:].strip()]
+            removed = [ln[2:] for ln in diff if ln.startswith("- ") and ln[2:].strip()]
+            print(f"Изменено после {last['id']}: новых/изменённых строк {len(added)}, удалённых "
+                  f"{len(removed)}. Проверьте только новые; удалённые — для контекста.")
+            for ln in added:
+                print(f"+ {ln}")
+            for ln in removed:
+                print(f"- {ln}")
     elif a.action == "list":
         for v in rows:
             cur = "актуальна" if file_sha(p, v["target"]) == v["sha"] else "устарела"
             print(f"{v['id']}\t{v['role']}\t{v['target']}\t{v['executor']}\t{cur}\t{v['text'][:70]}")
+
+
+def cmd_digest(a):
+    """Весь реестр одним компактным выводом — вместо десятка claim show / list подряд.
+    Для написания и сверки итогового документа."""
+    p = P(project_dir(a.project))
+    st = load_state(p)
+    b = st.get("brief") or {}
+    srcs = {x["id"]: x for x in read_jsonl(p.sources)}
+    claims = [c for c in read_jsonl(p.claims) if c["status"] == "active"]
+    print(f"# {st.get('title')} — этап {st.get('stage')}, глубина {b.get('depth') or 'full'}")
+    if b.get("question"):
+        print(f"Вопрос: {b['question']}")
+    print("\n## Ключевые вопросы")
+    for q in st.get("key_questions") or []:
+        ans = [c["id"] for c in claims if c["id"] in (q.get("answer_claims") or [])
+               or c.get("question") == q["id"]]
+        print(f"{q['id']} [{q.get('status', 'open')}] {q['text']} → {', '.join(ans) or '—'}")
+    print("\n## Утверждения (действующие)")
+    for c in claims:
+        meta = c["kind"] + (f"/{c['confidence']}" if c.get("confidence") else "")
+        src = ",".join(f"{sid}({(srcs.get(sid) or {}).get('published') or '?'})" for sid in c["sources"])
+        line = f"{c['id']} [{meta}] {c['text']}"
+        if c.get("quote"):
+            line += f" «{c['quote'][:160]}»"
+        if src:
+            line += f" ← {src}"
+        if c.get("derived_from"):
+            line += f" ⇐ {','.join(c['derived_from'])}"
+        if c.get("switch"):
+            line += f" | смена выбора: {c['switch']}"
+        print(line)
+    gaps = [g for g in read_jsonl(p.gaps) if g["status"] == "open"]
+    if gaps:
+        print("\n## Открытые пробелы")
+        for g in gaps:
+            print(f"{g['id']} [{g.get('impact') or '-'}] {g['text']}" +
+                  (f" (искали: {g['searched']})" if g.get("searched") else ""))
+    vs = read_jsonl(verdicts_path(p))
+    if vs:
+        print("\n## Проверки")
+        for v in vs:
+            cur = "актуальна" if file_sha(p, v["target"]) == v["sha"] else "устарела"
+            print(f"{v['id']} {v['role']} {v['target']} ({v['executor']}, {cur})")
+    problems, warnings = collect_checks(p, release=True)
+    print(f"\n## Выпускная проверка: ошибок {len(problems)}, предупреждений {len(warnings)}"
+          f" — подробно: pf.py check --release")
 
 
 def cmd_gap(a):
@@ -1984,11 +2062,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--trigger", help="условие пересмотра"); s.add_argument("--review-date", dest="review_date")
     s.set_defaults(fn=cmd_decision)
 
-    s = sp.add_parser("verdict", help="независимые проверки: add | list (red-team, judge, counter)")
-    s.add_argument("action", choices=["add", "list"])
+    s = sp.add_parser("verdict", help="независимые проверки: add | diff | list")
+    s.add_argument("action", choices=["add", "diff", "list"])
     s.add_argument("--role", choices=list(VERDICT_ROLES)); s.add_argument("--target")
     s.add_argument("--text"); s.add_argument("--executor", choices=["subagent", "self"])
     s.set_defaults(fn=cmd_verdict)
+
+    s = sp.add_parser("digest", help="весь реестр одним компактным выводом (для написания итога)")
+    s.set_defaults(fn=cmd_digest)
 
     s = sp.add_parser("review", help="что пора пересмотреть")
     s.add_argument("--days", type=int, default=90); s.set_defaults(fn=cmd_review)
@@ -2021,7 +2102,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-READ_ONLY = {"status", "list", "check", "impact", "cost", "review", "hook", "fetch"}
+READ_ONLY = {"status", "list", "check", "impact", "cost", "review", "hook", "fetch", "digest"}
 
 
 def main():
