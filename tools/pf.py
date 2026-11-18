@@ -1042,6 +1042,11 @@ def required_verdicts(p: P) -> list[tuple[str, str]]:
     return out
 
 
+def in_claude_code() -> bool:
+    """Агент работает в Claude Code (там есть субагенты); в Codex/Cursor — нет."""
+    return bool(os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+
+
 def verdicts_path(p: P) -> Path:
     return p.d / "evidence" / "verdicts.jsonl"
 
@@ -1581,6 +1586,12 @@ def collect_checks(p: P, release: bool = False) -> tuple[list[str], list[str]]:
                 f"{role}: {tgt_file} изменён после проверки {last['id']} — повторите проверку "
                 f"по текущей версии")
         if last.get("executor") == "self" and role != "counter":  # поиск опровержений ведёт сам агент
+            # В Claude Code есть субагенты — самопроверка автора там не засчитывается: в замере
+            # Haiku, проверявший себя сам, пропустил усиления в 9 строках из 11.
+            if in_claude_code():
+                strict.append(f"{role}: проверку {last['id']} выполнил сам автор, а в Claude Code "
+                              f"она должна идти отдельным субагентом {role} — запустите его")
+                continue
             warnings.append(f"{role}: проверку {last['id']} выполнил сам автор — менее надёжно, "
                             f"чем отдельный субагент")
     # Ключевые вопросы: у каждого — ответ (действующие утверждения) или честный пробел
