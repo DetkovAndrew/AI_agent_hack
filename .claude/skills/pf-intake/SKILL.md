@@ -57,7 +57,9 @@ description: Этап 0 — постановка задачи. Уточнить 
    - `red-team` (Agent, `model: sonnet`) — возражения к рекомендации;
    - `judge` (Haiku) — обещания и смысл ключевых фактов против продукта и цитат;
    - итог поиска опровержений (п. 5);
-   `pf.py verdict add --role red-team|judge|counter --target deliverables/summary.md --text "..."`.
+   - `fidelity` (Sonnet) — **последней**, по финальному тексту: не говорит ли документ больше,
+     чем факты (анонс ≠ запуск, потерянные единицы, мнение автора, перенос на другой объект);
+   `pf.py verdict add --role red-team|judge|counter|fidelity --target deliverables/summary.md --text "..."`.
    Правишь summary после judge — judge повторяет проверку новой версии.
 8. `pf.py check --release` → исправить ошибки → `pf.py report` → `pf.py stage choice --next "PM
    подтверждает вариант или просит полный разбор"`. Отчёт и переход к выбору без пройденной

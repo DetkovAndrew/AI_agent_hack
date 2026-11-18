@@ -995,6 +995,7 @@ VERDICT_ROLES = {
     "red-team": "возражения к вариантам и рекомендации",
     "judge": "сверка обещаний и смысла фактов с продуктом и источниками",
     "counter": "поиск опровержений ключевых фактов рекомендации",
+    "fidelity": "пересказ в документе не сильнее процитированных утверждений",
 }
 
 
@@ -1004,12 +1005,18 @@ def file_sha(p: P, rel: str) -> str | None:
 
 
 def subagent_ran(role: str, since: str) -> bool:
-    """Claude Code: был ли запуск субагента этой роли после since (по журналам сессий)."""
+    """Claude Code: был ли запуск субагента этой роли после since в сессии, работавшей
+    именно в этом репозитории (cwd), — чтобы не засчитать субагента соседнего прогона."""
+    root = str(ROOT)
     for d in transcript_dirs():
         for m in d.rglob("subagents/*.meta.json"):
             try:
-                if json.loads(m.read_text(encoding="utf-8")).get("agentType") == role and \
-                        dt.datetime.fromtimestamp(m.stat().st_mtime).isoformat() >= since[:19]:
+                if json.loads(m.read_text(encoding="utf-8")).get("agentType") != role or \
+                        dt.datetime.fromtimestamp(m.stat().st_mtime).isoformat() < since[:19]:
+                    continue
+                tr = m.with_name(m.name.replace(".meta.json", ".jsonl"))
+                cwd = re.search(r'"cwd":"([^"]*)"', tr.read_text(encoding="utf-8", errors="ignore")[:20000])
+                if cwd and (cwd.group(1) == root or cwd.group(1).startswith(root + "/")):
                     return True
             except (OSError, json.JSONDecodeError):
                 continue
@@ -1022,12 +1029,15 @@ def required_verdicts(p: P) -> list[tuple[str, str]]:
     quick = (load_state(p).get("brief") or {}).get("depth") == "quick"
     out = []
     if quick and (dl / "summary.md").exists():
-        out += [(r, "deliverables/summary.md") for r in ("red-team", "judge", "counter")]
+        out += [(r, "deliverables/summary.md") for r in ("red-team", "judge", "counter", "fidelity")]
     else:
         if (dl / "options.md").exists():
             out += [("red-team", "deliverables/options.md"), ("counter", "deliverables/options.md")]
         if (dl / "comms_strategy.md").exists():
             out.append(("judge", "deliverables/comms_strategy.md"))
+        for doc in ("situation.md", "summary.md"):
+            if (dl / doc).exists():
+                out.append(("fidelity", f"deliverables/{doc}"))
     return out
 
 
@@ -1477,7 +1487,8 @@ def collect_checks(p: P, release: bool = False) -> tuple[list[str], list[str]]:
         how = (f"pf.py verdict add --role {role} --target {tgt_file} --text \"...\" "
                f"({VERDICT_ROLES[role]})")
         if not mine:
-            legacy = {"red-team": "red-team", "judge": "judge", "counter": "опроверж"}[role]
+            legacy = {"red-team": "red-team", "judge": "judge", "counter": "опроверж",
+                      "fidelity": "\x00"}[role]
             if legacy in titles:
                 warnings.append(f"{role}: проверка записана старым способом (источник без отпечатка "
                                 f"документа) — повторите и запишите: {how}")
@@ -1488,10 +1499,10 @@ def collect_checks(p: P, release: bool = False) -> tuple[list[str], list[str]]:
         if file_sha(p, tgt_file) != last["sha"]:
             # Текст обещаний поменялся после сверки — judge должен посмотреть новую версию;
             # возражения red-team и поиск опровержений касаются выбора, а не формулировок.
-            (strict if role == "judge" else warnings).append(
+            (strict if role in ("judge", "fidelity") else warnings).append(
                 f"{role}: {tgt_file} изменён после проверки {last['id']} — повторите проверку "
                 f"по текущей версии")
-        if last.get("executor") == "self":
+        if last.get("executor") == "self" and role != "counter":  # поиск опровержений ведёт сам агент
             warnings.append(f"{role}: проверку {last['id']} выполнил сам автор — менее надёжно, "
                             f"чем отдельный субагент")
     # Ключевые вопросы: у каждого — ответ (действующие утверждения) или честный пробел

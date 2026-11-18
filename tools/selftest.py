@@ -110,14 +110,15 @@ def main():
         for need in ("пункт без ссылки", "red-team: нет проверки", "counter: нет проверки"):
             if need not in out:
                 failures.append(f"check --release: нет «{need}»\n{out}")
-        for role in ("red-team", "judge", "counter"):
+        for role in ("red-team", "judge", "counter", "fidelity"):
             pf("verdict", "add", "--role", role, "--target", "deliverables/summary.md",
                "--text", "проверено", "--executor", "subagent")
         sm.write_text(sm.read_text(encoding="utf-8").replace(
             "- Пункт без всякой ссылки на реестр утверждений.\n", ""), encoding="utf-8")
         pf("check", "--release", expect="judge: deliverables/summary.md изменён после проверки")
-        pf("verdict", "add", "--role", "judge", "--target", "deliverables/summary.md",
-           "--text", "проверено повторно", "--executor", "subagent")
+        for role in ("judge", "fidelity"):
+            pf("verdict", "add", "--role", role, "--target", "deliverables/summary.md",
+               "--text", "проверено повторно", "--executor", "subagent")
         pf("report", absent="выпускная проверка не пройдена")
 
         # Свежесть, пересказы, порог смены рекомендации
