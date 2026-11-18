@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -565,16 +566,13 @@ def cmd_fetch(a):
         die(f"домен не в списке разрешённых источников ({', '.join(allowed)}). "
             f"Добавьте: pf.py set brief.allowed_sources <домен> --append, или --force с "
             f"обоснованием в журнале.")
-    req = urllib.request.Request(a.url, headers={
-        "User-Agent": "Mozilla/5.0 (pf-strategist research bot; open sources only)"})
     try:
-        with urllib.request.urlopen(req, timeout=a.timeout) as r:
-            data = r.read()
-            ctype = r.headers.get("Content-Type", "")
+        data, ctype = http_get(a.url, a.timeout)
     except Exception as e:  # noqa: BLE001
         journal(p, f"НЕ УДАЛОСЬ загрузить {a.url}: {e}", "error")
-        die(f"не удалось загрузить {a.url}: {e}. Ошибка записана в журнал; "
-            f"используйте другой источник или WebFetch.", 2)
+        hint = (" Адрес, вероятно, неверный — найдите страницу поиском, не угадывайте URL."
+                if "404" in str(e) else " Используйте другой источник или WebFetch.")
+        die(f"не удалось загрузить {a.url}: {e}. Ошибка записана в журнал.{hint}", 2)
     if "pdf" in ctype or a.url.lower().endswith(".pdf"):
         ext = ".pdf"
     elif "html" in ctype:
@@ -598,6 +596,32 @@ def cmd_fetch(a):
                           note=a.note, published=a.published, origin=a.origin)
     print(json.dumps({k: row[k] for k in ("id", "title", "text", "chars", "flags")},
                      ensure_ascii=False))
+
+
+def http_get(url: str, timeout: int) -> tuple[bytes, str]:
+    """Скачать открытую страницу. Бот честно себя называет; при временных сбоях (5xx, 429,
+    таймаут) — до двух повторов с паузой. Защиту сайтов не обходим."""
+    import time
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (pf-strategist research bot; open sources only)",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"})
+    last = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read(), r.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code < 500 and e.code != 429:
+                raise
+        except TimeoutError as e:
+            last = e
+        except OSError as e:
+            if "timed out" not in str(e):
+                raise
+            last = e
+        time.sleep(3 * (attempt + 1))
+    raise last
 
 
 def r_charset(ctype: str) -> str:
@@ -1515,7 +1539,7 @@ def build_parser() -> argparse.ArgumentParser:
                                                                                  help="кто автор/издатель")
 
     s = sp.add_parser("fetch", help="скачать веб-страницу/файл и зарегистрировать источник")
-    s.add_argument("url"); src_opts(s); s.add_argument("--timeout", type=int, default=30)
+    s.add_argument("url"); src_opts(s); s.add_argument("--timeout", type=int, default=45)
     s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_fetch)
 
     s = sp.add_parser("ingest", help="зарегистрировать локальный файл или папку")
