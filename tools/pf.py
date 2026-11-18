@@ -733,6 +733,24 @@ def source_texts(p: P, sids: list[str]) -> dict[str, str]:
     return out
 
 
+HEDGES = [r"\bчасто", r"\bобычно", r"\bоколо\b", r"\bпримерно", r"\bпорядка\b", r"\bмож(ет|ут)\b",
+          r"\bпо оценк", r"\bв среднем", r"\bиногда", r"\bвероятно", r"\bдо\s+\d", r"\bсчита",
+          r"\bпо мнению", r"\boften\b", r"\btypically\b", r"\bup to\b", r"\baround\b",
+          r"\bapproximately\b", r"\bmay\b", r"\bmight\b", r"\bestimated?\b", r"\broughly\b",
+          r"\bas much as\b", r"\bbelieves?\b", r"\baccording to\b", r"\bon average\b"]
+
+
+def dropped_hedges(quote: str, text: str) -> list[str]:
+    """Оговорки цитаты («часто», «до», «по оценкам»), которых нет в утверждении: так «часто
+    достигает 240 ₽» превращается в «стоит 240 ₽». Утверждение с любой своей оговоркой
+    (или ~, ≈, «до») считаем аккуратным."""
+    q, t = _norm(quote or ""), _norm(text)
+    found = [m.group(0).strip() for h in HEDGES for m in [re.search(h, q)] if m]
+    if not found or any(re.search(h, t) for h in HEDGES) or re.search(r"[~≈]|\bдо\b|\bот\b", t):
+        return []
+    return found
+
+
 def provenance(s: dict) -> str:
     """fetched — снимок скачан pf.py; file — файл PM; excerpt — веб-текст вставлен агентом;
     search — сводка поиска без URL; human — слова PM/интервью."""
@@ -760,18 +778,23 @@ def verify_claim(p: P, c: dict) -> dict:
         res["provenance"] = "excerpt"
     q = c.get("quote")
     if q:
-        nq = _norm(q)
-        if nq in full:
-            res["quote"] = "exact"
-        else:
-            # Допускаем только расхождения в пунктуации и пробелах: все слова цитаты должны
-            # стоять в источнике в том же порядке (подмена одного слова — уже не цитата).
-            words = re.findall(r"\w+", nq)
+        # Цитата может состоять из нескольких дословных фрагментов через « … » — каждый
+        # сверяется отдельно. Допускаем только расхождения в пунктуации и пробелах: все слова
+        # фрагмента стоят в источнике в том же порядке (подмена одного слова — уже не цитата).
+        verdicts = []
+        for frag in [x for x in re.split(r"\s*(?:…|\.\.\.)\s*", _norm(q)) if x.strip()]:
+            if frag in full:
+                verdicts.append("exact")
+                continue
+            words = re.findall(r"\w+", frag)
             pat = r"\W+".join(re.escape(w) for w in words)
-            res["quote"] = "approx" if words and re.search(pat, full) else "not_found"
+            verdicts.append("approx" if words and re.search(pat, full) else "not_found")
+        res["quote"] = ("not_found" if "not_found" in verdicts else
+                        "approx" if "approx" in verdicts else "exact")
     # Числа, посчитанные по таблице, в её тексте не встречаются — их проверяет скрипт в analysis/.
     if all(sid in tables for sid in texts):
         return res
+    res["dropped_hedges"] = dropped_hedges(q, c["text"]) if q else []
     src_nums = _numbers(full)
     # Числа из утверждений, из которых выведено это, тоже считаются подтверждёнными.
     allc = {x["id"]: x for x in read_jsonl(p.claims)}
@@ -780,6 +803,11 @@ def verify_claim(p: P, c: dict) -> dict:
             src_nums |= _numbers(allc[d]["text"])
     res["missing_numbers"] = sorted(n for n in _numbers(c["text"], claim=True)
                                     if not _covered(n, src_nums))
+    if q:  # число есть на странице, но не в цитате: склеено несколько фактов под одной цитатой
+        qn = _numbers(q) | {n for d in c.get("derived_from", []) if d in allc
+                            for n in _numbers(allc[d]["text"])}
+        res["outside_quote"] = sorted(n for n in _numbers(c["text"], claim=True)
+                                      if _covered(n, src_nums) and not _covered(n, qn))
     return res
 
 
@@ -833,6 +861,12 @@ def cmd_claim(a):
                   f"с --derived или источником-расчётом из analysis/.")
         if v.get("quote") == "no_quote":
             print("ВНИМ. Факт без --quote: проверить его по источнику механически нельзя.")
+        if v.get("outside_quote"):
+            print(f"ВНИМ. Чисел {', '.join(v['outside_quote'])} нет в цитате — добавьте фрагмент с ними "
+                  f"через « … » (--quote \"фрагмент 1 … фрагмент 2\") или запишите отдельным фактом.")
+        if v.get("dropped_hedges"):
+            print(f"ВНИМ. В цитате есть оговорка «{', '.join(v['dropped_hedges'])}», а в утверждении её "
+                  f"нет — не превращайте «часто/до/по оценкам» в общее правило.")
         if v.get("provenance") == "excerpt":
             print("ВНИМ. Факт опирается только на выдержку, вставленную вручную, а не на скачанную "
                   "страницу: цитата сверена с выдержкой. В документе пометьте «по выдержке».")
@@ -1068,6 +1102,12 @@ def cmd_check(a):
             v = verify_claim(p, c)
             if v["quote"] == "not_found":
                 problems.append(f"{c['id']}: цитата не найдена в источнике {', '.join(c['sources'])}")
+            if v.get("outside_quote"):
+                warnings.append(f"{c['id']}: чисел {', '.join(v['outside_quote'])} нет в цитате — "
+                                f"добавьте фрагмент через « … » или разбейте факт")
+            if v.get("dropped_hedges"):
+                warnings.append(f"{c['id']}: в цитате оговорка «{', '.join(v['dropped_hedges'])}», "
+                                f"в утверждении — нет; формулировка сильнее источника")
             if v.get("provenance") == "excerpt":
                 warnings.append(f"{c['id']}: факт стоит только на выдержке без снимка страницы "
                                 f"({', '.join(c['sources'])}) — сверка цитаты условна")
