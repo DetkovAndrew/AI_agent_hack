@@ -76,8 +76,58 @@ def main():
         batch = d / "analysis" / "b.txt"
         batch.write_text("gap list\nclaim show C001\n", encoding="utf-8")
         pf("batch", str(batch), expect="Выполнено команд: 2")
-        pf("report")
+        pf("report", ok=False, expect="выпускная проверка не пройдена")
+        pf("report", "--draft", expect="без выпускной проверки")
         pf("status", "--brief")
+
+        # Параллельная запись: 8 процессов одновременно — ID не должны повториться
+        procs = [subprocess.Popen([sys.executable, str(ROOT / "tools" / "pf.py"), "--project", SLUG,
+                                   "claim", "add", f"Гипотеза {i}", "--kind", "hypothesis"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                 for i in range(8)]
+        for pr in procs:
+            pr.wait()
+        pf("check", absent="повторяющиеся ID")
+
+        # Косвенно отозванное основание решения всплывает в review
+        pf("claim", "add", "Вывод из допущения", "--kind", "hypothesis", "--derived", "C003")
+        cid = pf("claim", "list").strip().splitlines()[-1].split("\t")[0]
+        pf("decision", "add", "--title", "Тест 2", "--rationale", "r", "--owner", "PM",
+           "--basis", cid, "--metric", "m", "--trigger", "t", "--review-date", "2030-01-01")
+        pf("review", expect="выведено из отозванного C003")
+
+        # Выпуск: вопрос, ответ, проверки с отпечатком документа
+        pf("question", "add", "Какая цена?", "--why", "меняет выбор")
+        pf("question", "close", "Q001", "--claims", "C001")
+        sm = d / "deliverables" / "summary.md"
+        sm.write_text("# Итог\n\n## Ответ\nЦена 599 ₽ [C001], оставить как есть.\n\n"
+                      "## Почему\n- Цена подтверждена страницей компании [C001].\n"
+                      "- Пункт без всякой ссылки на реестр утверждений.\n\n"
+                      "Возражения учтены. Чего не обещаем: скидок. Сверка обещаний. "
+                      "Сравнение с контролем. Нежелательные эффекты.\n", encoding="utf-8")
+        pf("set", "brief.depth", "quick")
+        out = pf("check", "--release")
+        for need in ("пункт без ссылки", "red-team: нет проверки", "counter: нет проверки"):
+            if need not in out:
+                failures.append(f"check --release: нет «{need}»\n{out}")
+        for role in ("red-team", "judge", "counter"):
+            pf("verdict", "add", "--role", role, "--target", "deliverables/summary.md",
+               "--text", "проверено", "--executor", "subagent")
+        sm.write_text(sm.read_text(encoding="utf-8").replace(
+            "- Пункт без всякой ссылки на реестр утверждений.\n", ""), encoding="utf-8")
+        pf("check", "--release", expect="judge: deliverables/summary.md изменён после проверки")
+        pf("verdict", "add", "--role", "judge", "--target", "deliverables/summary.md",
+           "--text", "проверено повторно", "--executor", "subagent")
+        pf("report", absent="выпускная проверка не пройдена")
+
+        # Свежесть, пересказы, порог смены рекомендации
+        pf("source", "add", "--kind", "note", "--title", "Пересказ", "--retells", "S001",
+           "--text", "Компания продаёт eSIM для двухсот стран. Цена 599 рублей в месяц.")
+        pf("claim", "add", "Цена 599 ₽/мес (два источника)", "--kind", "fact", "--src", "S001,S004",
+           "--quote", "Цена 599 рублей в месяц")
+        sm.write_text(sm.read_text(encoding="utf-8") + "\nЕщё [C003] и [C016].\n", encoding="utf-8")
+        pf("check", expect="пересказы одного первоисточника S001")
+        pf("claim", "switch", "C003", "--range", "3..8%", "--switch", "при <3% → вариант A")
     finally:
         shutil.rmtree(d, ignore_errors=True)
         if prev is not None:
