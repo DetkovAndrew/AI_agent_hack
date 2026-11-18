@@ -32,6 +32,11 @@ def pf(*args, ok=True, expect=None, absent=None):
 
 
 def main():
+    # Codex читает не больше 32 КБ инструкций проекта (project_doc_max_bytes) — держим запас.
+    size = (ROOT / "AGENTS.md").stat().st_size
+    if size > 28000:
+        failures.append(f"AGENTS.md {size} байт — ближе 28 КБ к лимиту Codex (32 КБ); вынесите "
+                        f"подробности в .claude/skills/ или knowledge/")
     prev = ACTIVE.read_text(encoding="utf-8") if ACTIVE.exists() else None
     d = ROOT / "projects" / SLUG
     shutil.rmtree(d, ignore_errors=True)
@@ -106,6 +111,12 @@ def main():
                       "Возражения учтены. Чего не обещаем: скидок. Сверка обещаний. "
                       "Сравнение с контролем. Нежелательные эффекты.\n", encoding="utf-8")
         pf("set", "brief.depth", "quick")
+        pf("set", "brief.breadth", "narrow")
+        out = pf("check", "--release")
+        if "скачано страниц 0 из 3" not in out:
+            failures.append(f"ширина: нет требования страниц\n{out}")
+        pf("gap", "add", "Открытых данных о цене нет", "--why", "тест", "--how", "запросить",
+           "--q", "Q001", "--searched", "поиск по сайтам компании и СМИ")
         out = pf("check", "--release")
         for need in ("пункт без ссылки", "red-team: нет проверки", "counter: нет проверки"):
             if need not in out:

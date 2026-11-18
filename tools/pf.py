@@ -658,6 +658,13 @@ def cmd_fetch(a):
     else:
         text = extract_text(tmp)
     tmp.unlink(missing_ok=True)
+    if ext == ".pdf" and text.startswith("[PDF: установите"):
+        journal(p, f"НЕ УДАЛОСЬ загрузить {a.url}: PDF скачан, но текст не извлечён (нет pypdf)", "error")
+        die("PDF скачан, но текст не извлечён: нет библиотеки pypdf (pip install --user pypdf). "
+            "До установки — WebFetch и дословная выдержка через source add --kind web --url ... --text.", 2)
+    if not (st.get("key_questions") or []):
+        print("ВНИМ. Ключевых вопросов ещё нет — сначала pf.py question add: поиск должен идти "
+              "от вопросов, иначе он получается узким и случайным.")
     published = a.published or (detect_published(data.decode(r_charset(ctype), errors="replace"))
                                  if ext == ".html" else None)
     with project_lock():
@@ -1040,6 +1047,18 @@ def required_verdicts(p: P) -> list[tuple[str, str]]:
             if (dl / doc).exists():
                 out.append(("fidelity", f"deliverables/{doc}"))
     return out
+
+
+BREADTH = {  # скачанных страниц (минимум) и фактов на страницу для выпуска
+    "narrow": (3, 1.0, "3–4 страницы: самое важное, дешевле (~1 USD на Sonnet)"),
+    "normal": (6, 1.5, "6–10 страниц: по умолчанию"),
+    "wide": (12, 2.0, "12–20 страниц: широкий обзор рынка, дороже"),
+}
+
+
+def breadth(p: P) -> str:
+    b = (load_state(p).get("brief") or {}).get("breadth") or "normal"
+    return b if b in BREADTH else "normal"
 
 
 def in_claude_code() -> bool:
@@ -1594,6 +1613,27 @@ def collect_checks(p: P, release: bool = False) -> tuple[list[str], list[str]]:
                 continue
             warnings.append(f"{role}: проверку {last['id']} выполнил сам автор — менее надёжно, "
                             f"чем отдельный субагент")
+    # Ширина поиска: страниц и фактов не меньше выбранного уровня — или объяснение, почему нет
+    web_task = any(x.get("kind") == "web" for x in srcs.values()) or \
+        (load_state(p).get("brief") or {}).get("breadth")
+    if web_task and ((p.d / "deliverables/summary.md").exists() or
+                     (p.d / "deliverables/situation.md").exists()):
+        lvl = breadth(p)
+        need_pages, per_page, _ = BREADTH[lvl]
+        fetched = [x for x in srcs.values() if x.get("kind") == "web" and x.get("raw")]
+        facts = [c for c in claims.values() if c["status"] == "active" and c["kind"] == "fact"]
+        explained = any(g.get("searched") for g in gaps.values())
+        if len(fetched) < need_pages and not explained:
+            strict.append(f"ширина «{lvl}»: скачано страниц {len(fetched)} из {need_pages} — ищите "
+                          f"дальше (из каждого поиска скачивайте 2–3 лучших результата) или "
+                          f"объясните пробелом с --searched, что искали и не нашли")
+        if fetched and len(facts) < len(fetched) * per_page:
+            warnings.append(f"ширина «{lvl}»: фактов {len(facts)} на {len(fetched)} скачанных страниц — "
+                            f"со страниц взято мало; берите все факты, относящиеся к ключевым вопросам")
+        unused = [x["id"] for x in fetched if x.get("chars", 0) > 2000 and
+                  not any(x["id"] in c["sources"] for c in claims.values())]
+        if unused:
+            warnings.append(f"скачаны, но не использованы: {', '.join(unused)}")
     # Ключевые вопросы: у каждого — ответ (действующие утверждения) или честный пробел
     st = load_state(p)
     kq = st.get("key_questions") or []
