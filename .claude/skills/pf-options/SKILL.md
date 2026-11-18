@@ -18,10 +18,15 @@ description: Этап 3–4 — варианты и выбор. Не меньш�
    проверить первым.
 3. **Возражения.** Запусти субагента `red-team` на все варианты сразу. Включи в документ
    самое сильное возражение к каждому и свой ответ (или признание, что ответа нет).
+   Запиши: `pf.py verdict add --role red-team --target deliverables/options.md --text "..."`.
+3а. **Поиск опровержений** для 2–3 фактов, на которых держится рекомендация: по одному поиску
+   «против». Итог: `pf.py verdict add --role counter --target deliverables/options.md --text
+   "запросы: …; нашли: …"`.
 4. Сравнительная таблица по критериям PM (`brief.decision_criteria`). Отметь, какие оценки
    основаны на фактах, а какие на гипотезах.
 5. Рекомендация + условия, при которых рекомендация меняется («если Q003 окажется …, то B»).
-6. `pf.py check`, затем `pf.py stage choice --next "Ждём выбора варианта PM"` и
+   Для ключевых допущений и прогнозов — `pf.py claim switch C0NN --range ".." --switch "при … → B"`.
+6. `pf.py check --release`, затем `pf.py stage choice --next "Ждём выбора варианта PM"` и
    `pf.py set open_questions_to_human "Выберите вариант: A/B/C/D" --append`.
 7. **Остановись.** Покажи PM таблицу и рекомендацию и спроси выбор. Не пиши стратегию до ответа.
    После ответа: `pf.py set chosen_option "B: ..."`, `pf.py set open_questions_to_human --clear`,
