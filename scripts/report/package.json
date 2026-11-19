@@ -1,0 +1,12 @@
+{
+  "name": "pf-report",
+  "private": true,
+  "type": "module",
+  "description": "Описание работы агента: сборка docs/submission/report.md → HTML → PDF в Chromium",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}
