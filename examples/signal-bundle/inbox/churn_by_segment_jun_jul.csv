@@ -1,0 +1,8 @@
+segment_type,segment,base_k_on_2026-05-31,churned_k_jun_jul
+tenure,до 3 мес.,161,41
+tenure,3–12 мес.,352,63
+tenure,больше 12 мес.,379,33
+usage_may,только кино,268,52
+usage_may,только музыка,214,47
+usage_may,только книги,41,9
+usage_may,2 и более сервиса,369,29

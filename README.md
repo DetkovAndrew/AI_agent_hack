@@ -130,3 +130,8 @@ python3 tools/selftest.py             # самопроверка pf.py (для �
   cd scripts/report && npm install && npx playwright install chromium
   node build.mjs        # → docs/submission/report.pdf
   ```
+
+## Тренировочный проект
+`examples/signal-bundle/` — тренировочный проект на вымышленных данных с ловушками (пропуск в
+данных, смена определения метрики, инъекция, обещания рекламы против продукта, исправление
+выгрузки после перерыва) и сценарием сквозного прогона с чек-листом.
