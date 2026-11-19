@@ -25,7 +25,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PROJECTS = ROOT / "projects"
+# PF_PROJECTS_DIR — другая папка проектов (тесты, отдельное рабочее место).
+PROJECTS = Path(os.environ.get("PF_PROJECTS_DIR") or ROOT / "projects").resolve()
 ACTIVE_FILE = PROJECTS / ".active"
 PRICING_FILE = ROOT / "tools" / "pricing.json"
 
@@ -67,6 +68,14 @@ def today() -> str:
     return dt.date.today().isoformat()
 
 
+def shown(path: Path) -> str:
+    """Путь для вывода: от корня репозитория, если проект внутри него."""
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def die(msg: str, code: int = 1):
     print(f"Ошибка: {msg}", file=sys.stderr)
     sys.exit(code)
@@ -99,17 +108,20 @@ class project_lock:
         _LOCK_DEPTH += 1
         if _LOCK_DEPTH == 1:
             import tempfile
-            name = "pf-" + hashlib.sha1(str(ROOT).encode()).hexdigest()[:12] + ".lock"
+            name = "pf-" + hashlib.sha1(str(PROJECTS).encode()).hexdigest()[:12] + ".lock"
             _LOCK_FILE = open(Path(tempfile.gettempdir()) / name, "a+")
             try:
                 import fcntl
                 fcntl.flock(_LOCK_FILE, fcntl.LOCK_EX)
             except ImportError:
-                try:
-                    import msvcrt
-                    msvcrt.locking(_LOCK_FILE.fileno(), msvcrt.LK_LOCK, 1)
-                except Exception:  # noqa: BLE001
-                    pass
+                import msvcrt
+                _LOCK_FILE.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(_LOCK_FILE.fileno(), msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError:  # LK_LOCK сдаётся через ~10 с — ждём дальше
+                        continue
         return self
 
     def __exit__(self, *exc):
@@ -528,6 +540,9 @@ def extract_text(path: Path) -> str:
         return extract_pdf(path)
     if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
         return "[Изображение: агент читает его напрямую (Read). Опишите только видимое.]"
+    if ext in {".mp3", ".wav", ".m4a", ".ogg", ".mp4", ".mov", ".webm", ".mkv"}:
+        return (f"[Аудио/видео {ext}: pf.py не расшифровывает. Зарегистрируйте расшифровку "
+                f"(.srt/.vtt/.txt) и кадры (.png) — см. docs/media.md]")
     return f"[Формат {ext} не извлекается автоматически]"
 
 
@@ -728,10 +743,7 @@ def cmd_ingest(a):
     for f in files:
         data = f.read_bytes()
         text = extract_text(f)
-        try:
-            rel = str(f.relative_to(ROOT))
-        except ValueError:
-            rel = str(f)
+        rel = shown(f)
         auto = "table" if f.suffix.lower() in {".csv", ".tsv", ".xlsx", ".xls"} else "document"
         row = register_source(p, kind=a.kind or auto, title=a.title or f.name,
                               path=rel, text=text, raw_bytes=data, ext=f.suffix.lower(),
@@ -982,6 +994,11 @@ def cmd_claim(a):
         journal(p, f"{c['id']} отозвано: {a.reason}", "retract")
         render_status(p)
         print(f"{c['id']} отозвано. Проверьте зависимые выводы: pf.py impact --claim {c['id']}")
+        for e in kb_rows():
+            o = e.get("origin") or {}
+            if o.get("project") == p.d.name and o.get("ref") == c["id"] and e["status"] == "active":
+                print(f"В базе знаний на нём основана запись {e['id']}: "
+                      f"pf.py kb retract {e['id']} --reason \"...\" (или kb supersede)")
     elif a.action == "switch":
         c = claim_ids.get(a.text.upper()) or die("нет такого утверждения")
         if not a.switch:
@@ -1672,7 +1689,7 @@ def collect_checks(p: P, release: bool = False) -> tuple[list[str], list[str]]:
                     c["id"] in used and not c.get("switch"):
                 warnings.append(f"{c['id']}: {c['kind']} в выводах без порога смены рекомендации — "
                                 f"pf.py claim switch {c['id']} --range \"..\" --switch \"при … → вариант …\"")
-    return problems, warnings
+    warnings += kb_problems(p)
     return problems, warnings
 
 
@@ -1798,6 +1815,317 @@ def cmd_impact(a):
             print(f"- {q['id']} {q['text']}")
 
 
+# ---------------------------------------------------------------- база знаний между проектами
+#
+# Проектные реестры живут внутри проекта. База знаний переносит между проектами то, что стоит
+# помнить, но так, чтобы прежний ответ агента не стал фактом: у каждой записи есть
+# происхождение, и от него зависит, чем она может стать в новом проекте.
+#   fact     — факт с исходным источником (только через `kb promote Cxxx` из факта проекта)
+#              → в новом проекте снова факт со ссылкой на тот же источник, с предупреждением о давности;
+#   lesson   — вывод агента (гипотеза, прогноз, наблюдение о процессе) → только hypothesis/forecast;
+#   decision — решение, принятое PM в прошлом проекте (`kb promote Dxxx`) → assumption;
+#   note     — сказанное человеком (предпочтение, ограничение) → assumption.
+# Записи не удаляются: retract (неверно) и supersede (устарело, есть новая) сохраняют историю.
+
+KB_KINDS = {"fact": "факт с источником", "lesson": "вывод агента — не факт",
+            "decision": "прошлое решение", "note": "слова человека"}
+KB_STALE_DAYS = 180
+KB_STATUS = {"active": "действует", "retracted": "отозвана", "superseded": "заменена"}
+
+
+def kb_file() -> Path:
+    return PROJECTS / "_kb" / "kb.jsonl"
+
+
+def kb_rows() -> list[dict]:
+    return read_jsonl(kb_file())
+
+
+def _kb_norm(s: str) -> str:
+    return (s or "").lower().replace("ё", "е")
+
+
+def _kb_words(s: str) -> list[str]:
+    return re.findall(r"\w+", _kb_norm(s))
+
+
+def _kb_grams(s: str) -> dict[str, int]:
+    """Символьные триграммы слов: «удержание» и «удержания» почти совпадают — русская
+    морфология без словарей и внешних библиотек."""
+    out: dict[str, int] = {}
+    for w in _kb_words(s):
+        w = f" {w} "
+        for i in range(len(w) - 2):
+            g = w[i:i + 3]
+            out[g] = out.get(g, 0) + 1
+    return out
+
+
+def _kb_blob(e: dict) -> str:
+    src = " ".join((s.get("title") or "") for s in e.get("sources") or [])
+    return " ".join([e.get("text") or "", " ".join(e.get("tags") or []), src])
+
+
+def kb_search(rows: list[dict], query: str) -> list[tuple[float, dict]]:
+    import math
+    docs = [(e, _kb_grams(_kb_blob(e))) for e in rows]
+    n = len(docs) or 1
+    df: dict[str, int] = {}
+    for _, g in docs:
+        for k in g:
+            df[k] = df.get(k, 0) + 1
+    idf = {k: math.log((n + 1) / (v + 0.5)) for k, v in df.items()}
+
+    def vec(g):
+        return {k: c * idf.get(k, math.log(n + 1)) for k, c in g.items()}
+
+    q = vec(_kb_grams(query))
+    qn = math.sqrt(sum(v * v for v in q.values())) or 1
+    qwords = {w[:6] for w in _kb_words(query) if len(w) > 3}
+    out = []
+    for e, g in docs:
+        d = vec(g)
+        dn = math.sqrt(sum(v * v for v in d.values())) or 1
+        score = sum(v * d.get(k, 0) for k, v in q.items()) / (qn * dn)
+        # Совпадение основы слова (первые 6 букв) — надёжный сигнал «по формулировке».
+        score += 0.15 * len(qwords & {w[:6] for w in _kb_words(_kb_blob(e))})
+        if score > 0.05:
+            out.append((score, e))
+    return sorted(out, key=lambda x: -x[0])
+
+
+def _kb_line(e: dict, score: float | None = None) -> str:
+    st = "" if e["status"] == "active" else f" ({KB_STATUS[e['status']]}" + (
+        f" → {', '.join(e['superseded_by'])}" if e.get("superseded_by") else "") + ")"
+    o = e.get("origin") or {}
+    where = f"{o.get('project')}:{o.get('ref')}" if o.get("ref") else (o.get("project") or "—")
+    src = ""
+    if e.get("sources"):
+        s0 = e["sources"][0]
+        src = f"; источник: {s0.get('url') or s0.get('path') or s0.get('title')} ({(s0.get('retrieved_at') or '')[:10]})"
+    sc = f"{score:.2f}  " if score is not None else ""
+    return (f"{e['id']}  {sc}[{KB_KINDS[e['kind']]}]{st}  {e['text'][:110]}"
+            f"\n        из {where}{src}; теги: {', '.join(e.get('tags') or []) or '—'}")
+
+
+def _kb_get(rows: list[dict], kid: str) -> dict:
+    return next((e for e in rows if e["id"] == (kid or "").upper()), None) or die(f"нет записи {kid}")
+
+
+def cmd_kb(a):
+    rows = kb_rows()
+    act = a.action
+    if act == "add":
+        if a.kind not in ("lesson", "note"):
+            die("kb add — только --kind lesson (вывод агента) или note (слова человека). "
+                "Факты попадают в базу через `kb promote Cxxx` — вместе с источником; "
+                "решения — через `kb promote Dxxx`.")
+        if not a.text:
+            die("нужен текст записи")
+        links = split_ids(a.links)
+        bad = [x for x in links if x not in {e["id"] for e in rows}]
+        if bad:
+            die(f"неизвестные записи: {bad}")
+        slug = a.project or active_slug()
+        e = {"id": next_id(rows, "K"), "kind": a.kind, "text": a.text,
+             "provenance": "agent" if a.kind == "lesson" else "human",
+             "origin": {"project": slug, "ref": None}, "sources": [],
+             "tags": [t.lower() for t in split_ids(a.tags)], "links": links,
+             "status": "active", "created": now(), "history": []}
+        rows.append(e)
+        write_jsonl(kb_file(), rows)
+        print(_kb_line(e))
+    elif act == "promote":
+        p = P(project_dir(a.project))
+        ref = (a.text or "").upper()
+        dup = next((e for e in rows if (e.get("origin") or {}).get("project") == p.d.name
+                    and (e.get("origin") or {}).get("ref") == ref and e["status"] == "active"), None)
+        if dup:
+            print(f"Уже в базе: {dup['id']}")
+            return
+        e = {"id": next_id(rows, "K"), "origin": {"project": p.d.name, "ref": ref},
+             "tags": [t.lower() for t in split_ids(a.tags)], "links": split_ids(a.links),
+             "status": "active", "created": now(), "history": [], "sources": []}
+        if ref.startswith("C"):
+            c = next((c for c in read_jsonl(p.claims) if c["id"] == ref), None) or die("нет утверждения")
+            if c["status"] != "active":
+                die(f"{ref} отозвано — в базу знаний не переносится")
+            if c["kind"] == "synthetic":
+                die("синтетика в базу знаний не попадает: она не знание о рынке. Если из неё "
+                    "выросла гипотеза — сохраните её как `kb add --kind lesson`.")
+            srcs = {s["id"]: s for s in read_jsonl(p.sources)}
+            e["text"] = a.new_text or c["text"]
+            if c["kind"] == "fact":
+                e.update(kind="fact", provenance="source", confidence=c.get("confidence"),
+                         locator=c.get("locator"), quote=c.get("quote"))
+                for sid in c["sources"]:
+                    s = srcs.get(sid, {})
+                    e["sources"].append({k: s.get(k) for k in (
+                        "kind", "title", "url", "path", "origin", "published", "retrieved_at",
+                        "sha256", "reliability")})
+            else:
+                e.update(kind="lesson", provenance="agent", claim_kind=c["kind"])
+            e["tags"] = sorted(set(e["tags"]) | {t.lower() for t in c.get("tags", [])
+                                                 if not re.fullmatch(r"[A-Z]\d{3}", t)})
+        elif ref.startswith("D"):
+            d = next((d for d in read_jsonl(p.decisions) if d["id"] == ref), None) or die("нет решения")
+            e.update(kind="decision", provenance="human",
+                     text=a.new_text or f"{d['title']} — {d.get('rationale') or ''}".strip(" —"),
+                     decision={k: d.get(k) for k in ("owner", "metric", "status", "review_trigger")})
+        else:
+            die("promote принимает ID утверждения (Cxxx) или решения (Dxxx)")
+        rows.append(e)
+        write_jsonl(kb_file(), rows)
+        journal(p, f"В базу знаний: {ref} → {e['id']} [{e['kind']}]", "kb")
+        print(_kb_line(e))
+    elif act == "search":
+        pool = [e for e in rows if a.all or e["status"] == "active"]
+        if a.kind:
+            pool = [e for e in pool if e["kind"] == a.kind]
+        hits = kb_search(pool, a.text)[:a.limit]
+        if not hits:
+            print("Ничего не найдено. Переформулируйте: синонимы, английский термин, тег.")
+        for sc, e in hits:
+            print(_kb_line(e, sc))
+        hidden = sum(1 for e in rows if e["status"] != "active")
+        if hidden and not a.all:
+            print(f"(скрыто отозванных/заменённых: {hidden}; --all — показать)")
+    elif act == "show":
+        print(json.dumps(_kb_get(rows, a.text), ensure_ascii=False, indent=2))
+    elif act == "related":
+        e = _kb_get(rows, a.text)
+        urls = {s.get("url") for s in e.get("sources") or [] if s.get("url")}
+        tags = set(e.get("tags") or [])
+        for o in rows:
+            if o["id"] == e["id"]:
+                continue
+            why = []
+            if o["id"] in e.get("links", []) or e["id"] in o.get("links", []):
+                why.append("связь")
+            if e["id"] in (o.get("superseded_by") or []) or o["id"] in (e.get("superseded_by") or []):
+                why.append("замена")
+            if tags & set(o.get("tags") or []):
+                why.append("теги: " + ", ".join(sorted(tags & set(o["tags"]))))
+            if urls & {s.get("url") for s in o.get("sources") or []}:
+                why.append("тот же источник")
+            if (o.get("origin") or {}).get("project") == (e.get("origin") or {}).get("project"):
+                why.append("тот же проект")
+            if why:
+                print(_kb_line(o) + f"\n        ← {'; '.join(why)}")
+    elif act in ("list", "tags"):
+        pool = [e for e in rows if a.all or e["status"] == "active"]
+        if a.kind:
+            pool = [e for e in pool if e["kind"] == a.kind]
+        if act == "tags":
+            cnt: dict[str, int] = {}
+            for e in pool:
+                for t in e.get("tags") or []:
+                    cnt[t] = cnt.get(t, 0) + 1
+            for t, n in sorted(cnt.items(), key=lambda x: -x[1]):
+                print(f"{n:4}  {t}")
+            return
+        for e in pool:
+            if a.tags and not set(t.lower() for t in split_ids(a.tags)) & set(e.get("tags") or []):
+                continue
+            print(_kb_line(e))
+    elif act in ("retract", "supersede"):
+        e = _kb_get(rows, a.text)
+        if not a.reason:
+            die("укажите --reason: почему запись больше не верна")
+        by = split_ids(a.by)
+        if act == "supersede":
+            if not by:
+                die("supersede требует --by Kxxx — новую запись, которая заменяет эту")
+            _kb_get(rows, by[0])
+        e["history"].append({"at": now(), "from": e["status"], "note": a.reason})
+        e["status"] = "retracted" if act == "retract" else "superseded"
+        e["superseded_by"] = by
+        write_jsonl(kb_file(), rows)
+        print(f"{e['id']} → {KB_STATUS[e['status']]}. Проекты, которые её использовали, увидят "
+              f"предупреждение в `pf.py check`.")
+    elif act == "edit":
+        e = _kb_get(rows, a.text)
+        changes = {k: v for k, v in [("text", a.new_text)] if v}
+        if a.tags:
+            changes["tags"] = [t.lower() for t in split_ids(a.tags)]
+        if a.links:
+            changes["links"] = split_ids(a.links)
+        if not changes:
+            die("нечего менять: --new-text / --tags / --links")
+        e["history"].append({"at": now(), "edit": {k: e.get(k) for k in changes}, "note": a.reason})
+        e.update(changes)
+        write_jsonl(kb_file(), rows)
+        print(_kb_line(e))
+    elif act == "use":
+        kb_use(a, rows)
+
+
+def kb_use(a, rows):
+    """Перенести запись базы в активный проект — с тем статусом, который она заслуживает."""
+    p = P(project_dir(a.project))
+    e = _kb_get(rows, a.text)
+    if e["status"] != "active":
+        die(f"{e['id']} {KB_STATUS[e['status']]} — не используйте; см. pf.py kb show {e['id']}")
+    claims = read_jsonl(p.claims)
+    dup = next((c for c in claims if e["id"] in c.get("tags", []) and c["status"] == "active"), None)
+    if dup:
+        print(f"Уже в проекте: {dup['id']}")
+        return
+    origin = e.get("origin") or {}
+    srcs = []
+    if e["kind"] == "fact":
+        kind = "fact"
+        for s in e.get("sources") or []:
+            got = (s.get("retrieved_at") or "")[:10]
+            # В снимок идёт только цитата из исходного источника, не текст утверждения: иначе
+            # сверка чисел и цитаты в новом проекте сравнивала бы факт сам с собой.
+            row = register_source(
+                p, kind=s.get("kind") or "web", title=s.get("title") or e["text"][:60],
+                url=s.get("url"), path=s.get("path"),
+                text=f"Из базы знаний {e['id']} (проект {origin.get('project')}, {origin.get('ref')}).\n"
+                     f"Цитата: {e.get('quote') or '—'}\nМесто: {e.get('locator') or '—'}",
+                reliability=s.get("reliability"), published=s.get("published"),
+                origin=s.get("origin"), note=f"kb:{e['id']}; исходный источник получен {got or '?'}")
+            srcs.append(row["id"])
+            if got and got < (dt.date.today() - dt.timedelta(days=KB_STALE_DAYS)).isoformat():
+                print(f"ВНИМАНИЕ: источник получен {got}, больше {KB_STALE_DAYS} дн. назад — "
+                      f"проверьте актуальность (pf.py fetch {s.get('url') or ''}).")
+        text = e["text"]
+    elif e["kind"] == "lesson":
+        kind = e.get("claim_kind") if e.get("claim_kind") in ("hypothesis", "forecast") else "hypothesis"
+        text = f"По опыту проекта {origin.get('project')}: {e['text']}"
+    else:
+        kind = "assumption"
+        text = (f"Ранее решено ({origin.get('project')}): {e['text']}" if e["kind"] == "decision"
+                else f"Со слов человека (проект {origin.get('project')}): {e['text']}")
+    cid = next_id(claims, "C")
+    claims.append({"id": cid, "text": text, "kind": kind, "sources": srcs, "derived_from": [],
+                   "locator": e.get("locator"), "quote": e.get("quote"),
+                   "confidence": e.get("confidence") if kind == "fact" else "low",
+                   "question": a.q.upper() if a.q else None, "status": "active",
+                   "created": now(), "tags": [e["id"]]})
+    write_jsonl(p.claims, claims)
+    journal(p, f"{cid} [{kind}] из базы знаний {e['id']}", "kb")
+    render_status(p)
+    print(f"{cid}\t[{kind}] {text[:100]}")
+
+
+def kb_problems(p: P) -> list[str]:
+    """Предупреждения check: утверждения проекта на отозванных/заменённых записях базы."""
+    kb = {e["id"]: e for e in kb_rows()}
+    out = []
+    for c in read_jsonl(p.claims):
+        if c["status"] != "active":
+            continue
+        for t in c.get("tags", []):
+            e = kb.get(t)
+            if e and e["status"] != "active":
+                repl = f", замена: {', '.join(e['superseded_by'])}" if e.get("superseded_by") else ""
+                out.append(f"{c['id']}: взято из базы знаний {t}, а запись {KB_STATUS[e['status']]}{repl} — "
+                           f"отзовите или замените утверждение")
+    return out
+
+
 # ---------------------------------------------------------------- стоимость
 
 def load_pricing() -> dict:
@@ -1814,9 +2142,9 @@ def price_for(model: str, pricing: dict) -> dict:
 def transcript_dirs() -> list[Path]:
     base = Path.home() / ".claude" / "projects"
     enc = re.sub(r"[^A-Za-z0-9]", "-", str(ROOT))
-    # Сессия могла быть запущена из этой папки, вложенной или родительской (тогда фильтр по времени
-    # в cmd_cost отсекает работу до создания проекта).
-    return [d for d in base.glob("*") if d.is_dir() and (d.name.startswith(enc) or enc.startswith(d.name + "-"))] \
+    # Сессии агента запускаются из этой папки или вложенной. Родительскую не берём: там живут
+    # чужие сессии (например, разработка агента уровнем выше), и их ходы попали бы в расход проекта.
+    return [d for d in base.glob("*") if d.is_dir() and (d.name == enc or d.name.startswith(enc + "-"))] \
         if base.exists() else []
 
 
@@ -1923,11 +2251,11 @@ def cmd_report(a):
                      f"{', надёжность: ' + s['reliability'] if s.get('reliability') else ''})")
     out = dl / "REPORT.md"
     out.write_text("\n".join(parts) + "\n", encoding="utf-8")
-    print(f"Отчёт: {out.relative_to(ROOT)}")
+    print(f"Отчёт: {shown(out)}")
     if a.html:
         hp = dl / "REPORT.html"
         hp.write_text(md_to_html(out.read_text(encoding="utf-8"), st["title"]), encoding="utf-8")
-        print(f"HTML: {hp.relative_to(ROOT)}")
+        print(f"HTML: {shown(hp)}")
 
 
 def md_to_html(md: str, title: str) -> str:
@@ -1983,7 +2311,19 @@ def md_to_html(md: str, title: str) -> str:
 # ---------------------------------------------------------------- хуки
 
 def cmd_hook(a):
-    """Точки входа для хуков Claude Code. Никогда не падают с ошибкой."""
+    """Точки входа для хуков Claude Code. Сбой самого хука работу не останавливает.
+
+    SessionStart: stdout попадает в контекст модели.
+    Stop: stdout с кодом 0 модель НЕ видит (только человек в подробном режиме). Поэтому при
+    ошибках целостности хук завершается с кодом 2 и пишет их в stderr — Claude Code не даёт
+    закончить ответ и передаёт текст модели. Предупреждения ответ не блокируют. Если ответ уже
+    продолжается из-за этого хука (stop_hook_active), повторно не блокируем — без зацикливания.
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}") if not sys.stdin.isatty() else {}
+    except (json.JSONDecodeError, OSError, ValueError):
+        payload = {}
+    block = None
     try:
         slug = active_slug()
         if a.event == "session-start":
@@ -1994,14 +2334,26 @@ def cmd_hook(a):
                 print("[pf] Продолжайте с «Следующего действия». Не повторяйте шаги из журнала.")
             else:
                 print("[pf] Активного проекта нет. Предложите пользователю /pf-start.")
+            n_kb = sum(1 for e in kb_rows() if e["status"] == "active")
+            if n_kb:
+                print(f"[pf] База знаний: {n_kb} записей из прошлых проектов — "
+                      f"pf.py kb search \"...\" перед исследованием.")
         elif a.event == "stop":
             if slug and (PROJECTS / slug / "state.json").exists():
-                ns = argparse.Namespace(project=slug, quiet=True, strict=False)
-                cmd_check(ns)
+                problems, warnings = collect_checks(P(project_dir(slug)))
+                for x in warnings:
+                    print(f"ВНИМ.   {x}")
+                if problems and not payload.get("stop_hook_active"):
+                    block = ("[pf] pf.py check нашёл ошибки целостности — исправь их до "
+                             "завершения ответа (или объясни PM, почему сейчас нельзя):\n" +
+                             "\n".join(f"ОШИБКА  {x}" for x in problems))
     except SystemExit:
         pass
     except Exception as e:  # noqa: BLE001
         print(f"[pf] hook error: {e}")
+    if block:
+        print(block, file=sys.stderr)
+        sys.exit(2)
 
 
 # ---------------------------------------------------------------- CLI
@@ -2026,7 +2378,11 @@ def cmd_batch(a):
         print(f"> {line}")
         try:
             sub = ap.parse_args(args)
-            sub.fn(sub)
+            if sub.fn is cmd_fetch:  # загрузка не держит блокировку, как и вне batch
+                sub.fn(sub)
+            else:
+                with project_lock():
+                    sub.fn(sub)
         except SystemExit as e:
             if e.code not in (0, None):
                 print(f"Остановлено на строке {n} (выполнено команд: {done}). "
@@ -2150,6 +2506,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--service", required=True); s.add_argument("--usd", type=float, default=0)
     s.add_argument("--units"); s.add_argument("--note"); s.set_defaults(fn=cmd_cost_add)
 
+    s = sp.add_parser("kb", help="база знаний между проектами: add | promote | search | show | "
+                                 "related | list | tags | use | retract | supersede | edit")
+    s.add_argument("action", choices=["add", "promote", "search", "show", "related", "list", "tags",
+                                      "use", "retract", "supersede", "edit"])
+    s.add_argument("text", nargs="?", default="", help="текст, запрос или ID (Kxxx, Cxxx, Dxxx)")
+    s.add_argument("--kind", choices=list(KB_KINDS)); s.add_argument("--tags"); s.add_argument("--links")
+    s.add_argument("--new-text", dest="new_text"); s.add_argument("--reason"); s.add_argument("--by")
+    s.add_argument("--q", help="use: ID ключевого вопроса проекта")
+    s.add_argument("--all", action="store_true", help="показывать отозванные и заменённые")
+    s.add_argument("--limit", type=int, default=8)
+    s.set_defaults(fn=cmd_kb)
+
     s = sp.add_parser("report", help="собрать итоговый отчёт")
     s.add_argument("--html", action="store_true")
     s.add_argument("--draft", action="store_true", help="собрать черновик без выпускной проверки")
@@ -2163,12 +2531,14 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-READ_ONLY = {"status", "list", "check", "impact", "cost", "review", "hook", "fetch", "digest"}
+# Без общего замка: только чтение, а fetch и batch берут замок сами — fetch после скачивания,
+# batch на каждую команду, чтобы долгие загрузки не держали параллельных субагентов.
+READ_ONLY = {"status", "list", "check", "impact", "cost", "review", "hook", "fetch", "digest", "batch"}
 
 
 def main():
     a = build_parser().parse_args()
-    if a.cmd in READ_ONLY:  # fetch берёт замок сам, после скачивания
+    if a.cmd in READ_ONLY:
         a.fn(a)
     else:
         with project_lock():
