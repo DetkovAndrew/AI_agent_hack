@@ -6,6 +6,7 @@
 """
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -179,6 +180,7 @@ class PfSmoke(unittest.TestCase):
         self.assertIn("отозван", self.pf("kb", "use", "K001", ok=False).stderr)
 
     def test_mcp_server_wraps_pf(self):
+        sid = self.add_source("Текст для проверки MCP")
         msgs = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize",
              "params": {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -192,19 +194,83 @@ class PfSmoke(unittest.TestCase):
                         "arguments": {"text": "Рынок, вероятно, растёт", "kind": "hypothesis"}}},
             {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
              "params": {"name": "pf", "arguments": {"args": ["claim", "list"]}}},
+            {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+             "params": {"name": "pf_source_read", "arguments": {"id": sid, "seen": sid}}},
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "pf_focus", "arguments": {}}},
         ]
         r = subprocess.run([sys.executable, str(ROOT / "tools" / "mcp_server.py")], cwd=ROOT,
                            env=self.env, input="\n".join(json.dumps(m) for m in msgs) + "\n",
                            capture_output=True, text=True, encoding="utf-8", timeout=60)
         out = {m["id"]: m for m in map(json.loads, r.stdout.splitlines())}
-        self.assertEqual(sorted(out), [1, 2, 3, 4, 5], "на уведомление отвечать нельзя")
+        self.assertEqual(sorted(out), [1, 2, 3, 4, 5, 6, 7], "на уведомление отвечать нельзя")
         self.assertEqual(out[1]["result"]["protocolVersion"], "2025-06-18")
         names = {t["name"] for t in out[2]["result"]["tools"]}
-        self.assertTrue({"pf_status", "pf_claim_add", "pf_kb_search", "pf"} <= names)
+        self.assertTrue({"pf_status", "pf_claim_add", "pf_kb_search", "pf_source_read", "pf_focus", "pf"} <= names)
         self.assertTrue(out[3]["result"]["isError"], "факт без источника должен отклоняться и через MCP")
         self.assertIn("факт без источника", out[3]["result"]["content"][0]["text"])
         self.assertFalse(out[4]["result"]["isError"])
         self.assertIn("Рынок, вероятно, растёт", out[5]["result"]["content"][0]["text"])
+        self.assertIn("Уже прочитаны", out[6]["result"]["content"][0]["text"])
+        self.assertIn("Ключевых вопросов ещё нет", out[7]["result"]["content"][0]["text"])
+
+    def test_source_read_skips_ids_already_in_context(self):
+        first = self.add_source("Первый снимок для чтения")
+        second = self.add_source("Второй снимок для чтения")
+        out = self.pf("source", "read", "--id", f"{first},{second},{second}", "--seen", first).stdout
+        self.assertIn(f"Уже прочитаны в текущем контексте: {first}", out)
+        self.assertNotIn("Первый снимок для чтения", out)
+        self.assertEqual(out.count("Второй снимок для чтения"), 1)
+        fresh = self.pf("source", "read", "--id", first).stdout
+        self.assertIn("Первый снимок для чтения", fresh)
+
+    def test_fetch_reuse_keeps_snapshot_and_regular_fetch_refreshes(self):
+        page = Path(self.tmp.name) / "page.html"
+        page.write_text("<html><body>Цена 499 руб.</body></html>", encoding="utf-8")
+        self.assertIn("S001", self.pf("fetch", page.as_uri(), "--reuse").stdout)
+        page.write_text("<html><body>Цена 599 руб.</body></html>", encoding="utf-8")
+        reuse = self.pf("fetch", page.as_uri(), "--reuse").stdout
+        self.assertIn("Сохранённый снимок использован повторно", reuse)
+        self.assertIn("499", self.pf("source", "read", "--id", "S001").stdout)
+        self.assertIn("S002", self.pf("fetch", page.as_uri()).stdout)
+        self.assertIn("599", self.pf("source", "read", "--id", "S002").stdout)
+        self.assertIn("S002", self.pf("fetch", page.as_uri(), "--reuse").stdout)
+
+    def test_focus_combines_answers_and_keeps_open_gaps(self):
+        self.pf("question", "add", "Окупится ли пилот?", "--why", "Если нет, оставляем как есть")
+        self.pf("question", "add", "Нужен ли другой тариф?")
+        first = self.add_source()
+        second = self.add_source("Выручка 2025 года — 10 млн руб. (пересказ)")
+        self.pf("source", "retells", "--id", second, "--retells", first)
+        self.pf("claim", "add", "Выручка 2025 года — 10 млн руб.", "--kind", "fact", "--q", "Q001",
+                "--src", f"{first},{second}", "--quote", "Выручка 2025 года — 10 млн руб.")
+        self.pf("gap", "add", "Нужна себестоимость", "--q", "Q001", "--why", "Нет техкарт",
+                "--impact", "high", "--how", "Выгрузить техкарты")
+        self.pf("gap", "add", "Старый пробел", "--q", "Q001", "--why", "ожидаем расчёт")
+        self.pf("gap", "close", "G002", "--by", "C001")
+        out = self.pf("focus", "--q", "Q001").stdout
+        self.assertIn("Что меняет: Если нет, оставляем как есть", out)
+        self.assertIn(f"Факты: C001. Источники: {first}, {second}. По цепочкам пересказов: {first}.", out)
+        self.assertIn("G001 [high] Нужна себестоимость", out)
+        self.assertIn("Как закрыть: Выгрузить техкарты", out)
+        self.assertNotIn("Q002", out)
+        self.assertNotIn("G002", out)
+
+    def test_release_checks_decision_foundation_table(self):
+        self.pf("gap", "add", "Нужны техкарты", "--why", "Нет себестоимости")
+        table = ("## Сверка оснований рекомендации\n\n"
+                 "| Вывод | Основание | Что может опровергнуть | Когда меняем решение |\n"
+                 "|---|---|---|---|\n")
+        self.write_doc("foundations.md", table + "| Пилот условный | [G001] | Расчёт по техкартам | … |\n")
+        draft = self.pf("check", "--strict")
+        self.assertIn("ВНИМ.   deliverables", draft.stdout)
+        blocked = self.pf("stage", "choice", "--next", "Выбор PM", ok=False)
+        self.assertEqual(blocked.returncode, 3, blocked.stdout)
+        self.assertIn("заполните все четыре поля", blocked.stdout)
+        self.write_doc("foundations.md", table +
+                       "| Пилот условный | [G001] | Расчёт по техкартам | Вклад ≤ 0 → откладываем пилот |\n")
+        self.pf("check", "--release", "--strict")
+        self.pf("stage", "choice", "--next", "Выбор PM")
 
     def test_batch_with_fetch_does_not_deadlock(self):
         page = Path(self.tmp.name) / "page.html"
@@ -215,6 +281,93 @@ class PfSmoke(unittest.TestCase):
                            capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Выполнено команд: 2", r.stdout)
+
+    def test_quiet_batch_keeps_results_warnings_and_failure_location(self):
+        sid = self.add_source()
+        command = f'claim add "Выручка — 10 млн руб." --kind fact --src {sid}'
+        out = self.pf("batch", "-", "--quiet", stdin=f'{command}\nclaim show C999\n', ok=False)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("C001\t[fact]", out.stdout)
+        self.assertIn("Факт без --quote", out.stdout)
+        self.assertIn("Остановлено на строке 2", out.stdout)
+        self.assertIn("нет такого утверждения", out.stderr)
+        self.assertNotIn(command, out.stdout)
+
+    def test_verdict_context_preserves_full_quotes_and_cited_claims_only(self):
+        quote = "По оценке аналитиков выручка могла составить 10 млн руб. " * 4
+        quote = quote.strip()
+        sid = self.add_source(quote)
+        self.pf("claim", "add", "По оценке аналитиков выручка могла составить 10 млн руб.",
+                "--kind", "fact", "--src", sid, "--quote", quote, "--conf", "high")
+        self.pf("claim", "add", "Не связанная с документом гипотеза", "--kind", "hypothesis")
+        self.pf("claim", "retract", "C001", "--reason", "период уточняется")
+        target = "deliverables/summary.md"
+        self.write_doc("summary.md", f"# Итог\nБыло [C001, {sid}].\nПовтор [C001].\n")
+
+        out = self.pf("verdict", "context", "--target", target).stdout
+        self.assertIn(quote, out)
+        self.assertEqual(out.count("C001 [fact/high, retracted]"), 1, out)
+        self.assertIn("Причина отзыва: период уточняется", out)
+        self.assertNotIn("C002", out)
+
+        self.pf("verdict", "add", "--role", "fidelity", "--target", target, "--text", "Проверено",
+                "--executor", "self")
+        self.write_doc("summary.md", f"# Итог\nСтало [C999].\nПовтор [C001].\n")
+        diff = self.pf("verdict", "diff", "--role", "fidelity", "--target", f"projects/demo/{target}",
+                       "--evidence").stdout
+        self.assertIn("+Стало [C999].", diff)
+        self.assertIn("C999: нет в реестре", diff)
+        self.assertIn(quote, diff)  # Ссылка в соседней строке доступна при повторной проверке.
+        self.assertNotIn("C002", diff)
+
+    def test_semantic_check_on_known_errors_and_controls(self):
+        pf = runpy.run_path(str(PF))
+        limit = "Subscribers will get 50% off up to five barista made drinks a day."
+        change = "Pret A Manger is revamping its subscription scheme and scrapping its offer of five free coffees."
+        change_context = change + " From September, Pret will replace this with a new offer."
+        closing = "The programme will end automatically on December 31 2025."
+        launch = "Компания планирует запустить сервис в сентябре."
+        cases = (
+            (limit, limit, "Скидка на пять напитков в день. Пробный тариф действует до 31 марта.", "верхняя граница"),
+            (limit, limit, "Скидка на максимум пять напитков в день.", ""),
+            (change, change_context, "Pret в 2024 году свернул включённые ежедневные выдачи.", "состоявшееся событие"),
+            (change, change_context, "Pret объявил о переходе на новую схему с сентября.", ""),
+            (closing, closing, "Leon закрыл программу в декабре 2025 года.", "состоявшееся событие"),
+            (launch, launch + " Компания запустила сервис по плану.", "Компания запустила сервис в сентябре.", ""),
+            ("Рентабельность от 15% до 20%.", "", "Рентабельность 15–20%.", ""),
+            ("Цена поднимется до 599 рублей в месяц.", "", "Новая цена составит 599 ₽ в месяц.", ""),
+            ("Рентабельность может доходить до 30%.", "", "Рентабельность составляет 30%.", "верхняя граница"),
+            (closing, closing, "Если сеть закрыла программу, нужно проверить, что предложили клиентам.", ""),
+            ("Можно получить до 5 напитков в день.", "", "Клиент получает скидку 5 рублей.", ""),
+            (launch, launch, "Компания запустила сервис в сентябре.", "состоявшееся событие"),
+            (launch, launch, "Компания объявила о запуске сервиса с сентября.", ""),
+        )
+        for quote, snapshot, statement, expected in cases:
+            with self.subTest(statement=statement):
+                plans = pf["source_plans"](quote, {"S001": snapshot})
+                flags = pf["semantic_issues"](quote, plans, statement)
+                if expected:
+                    self.assertEqual(len(flags), 1, flags)
+                    self.assertIn(expected, flags[0])
+                else:
+                    self.assertEqual(flags, [])
+
+    def test_semantic_warnings_at_claim_add_and_in_release_document(self):
+        quote = "Pret will replace the plan in September. Customers can get up to five drinks a day."
+        sid = self.add_source(quote)
+        self.pf("claim", "add", "Pret объявила о замене схемы и лимите до пяти напитков в день.",
+                "--kind", "fact", "--src", sid, "--quote", quote)
+        added = self.pf("claim", "add", "Можно получить пять напитков в день.",
+                        "--kind", "fact", "--src", sid, "--quote", quote).stdout
+        self.assertIn("C002: потеряна верхняя граница", added)
+
+        self.write_doc("summary.md", "# Итог\nPret заменила схему. Пять напитков в день [C001].\n"
+                                    "Pret объявила о замене схемы и лимите до пяти напитков [C001].\n")
+        check = self.pf("check", "--release").stdout
+        affected = [line for line in check.splitlines() if "summary.md:2: C001" in line]
+        self.assertEqual(len(affected), 2, check)
+        self.assertTrue(all(line.startswith("ВНИМ.") and sid in line for line in affected))
+        self.assertNotIn("summary.md:3: C001", check)
 
     def test_cost_ignores_sessions_of_parent_folder(self):
         home = Path(self.tmp.name) / "home"

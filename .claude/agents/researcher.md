@@ -10,10 +10,13 @@ tools: Read, Bash, WebSearch, WebFetch, Grep, Glob
 
 Вход: ID проекта, ID и текст вопроса, контекст (кратко), разрешённые источники.
 
-1. Проверь, что уже есть: `python3 tools/pf.py claim list` и `python3 tools/pf.py source list`.
+1. Проверь, что уже есть: `python3 tools/pf.py focus --q Q001` для переданного вопроса.
+   Начни с пробела, закрытие которого может изменить решение. Если нужны данные PM, опиши их в пробеле.
 2. 2–5 поисковых запросов на русском и английском. Предпочитай первоисточники
    (см. `knowledge/methods/evidence-standards.md`). Не больше ~8 страниц — экономь.
-3. Нужную страницу сохрани: `python3 tools/pf.py fetch <url> --origin "..." --reliability ... --published ...`.
+3. Нужную страницу сохрани: `python3 tools/pf.py fetch <url> --reuse --origin "..." --reliability ... --published ...`.
+   Для проверки свежих данных вызови `fetch` без `--reuse`. Прочитай снимки одним вызовом
+   `python3 tools/pf.py source read --id S001,S002`, добавляя ранее прочитанные в этом чате ID в `--seen`.
    Если не загрузилась (ошибка записана в журнал) — WebFetch и `python3 tools/pf.py source add --kind web --url ... --title ... --text "<дословная выдержка>"`; без попытки fetch такая запись отклоняется.
    Неудачи не скрывай.
 4. Утверждения — `python3 tools/pf.py claim add ... --q <Qxxx>` (правила типов — как в AGENTS.md).

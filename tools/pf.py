@@ -353,7 +353,11 @@ def render_status(p: P, write: bool = True) -> str:
 
 
 def cmd_status(a):
-    p = P(project_dir(a.project))
+    slug = a.project or active_slug()
+    if not slug:
+        print('[pf] Активного проекта нет. Начните задачу в чате или выполните pf.py init <имя>.')
+        return
+    p = P(project_dir(slug))
     text = render_status(p, write=False)  # чтение статуса ничего не пишет
     if a.brief:
         st = load_state(p)
@@ -648,6 +652,13 @@ def cmd_fetch(a):
         die(f"домен не в списке разрешённых источников ({', '.join(allowed)}). "
             f"Добавьте: pf.py set brief.allowed_sources <домен> --append, или --force с "
             f"обоснованием в журнале.")
+    if a.reuse:
+        for row in reversed(read_jsonl(p.sources)):
+            if row.get("url") == a.url and row.get("raw") and row.get("text") and \
+                    (p.d / row["raw"]).is_file() and (p.d / row["text"]).is_file():
+                print_source_snapshot(row)
+                print("Сохранённый снимок использован повторно. Для обновления вызовите fetch без --reuse.")
+                return
     try:
         data, ctype = http_get(a.url, a.timeout)
     except Exception as e:  # noqa: BLE001
@@ -687,9 +698,7 @@ def cmd_fetch(a):
                               raw_bytes=data, ext=ext, reliability=a.reliability,
                               note=a.note, published=published, origin=a.origin,
                               retells=a.retells)
-    fl = f", ⚠ {','.join(row['flags'])}" if row.get("flags") else ""
-    print(f"{row['id']}\t{row['title'][:80]}\t{row.get('chars', 0)} симв.\t"
-          f"дата: {row.get('published') or '—'}\t{row.get('text')}{fl}")
+    print_source_snapshot(row)
     open_q = [q for q in (st.get("key_questions") or []) if q.get("status", "open") == "open"]
     if open_q:
         print(f"Из {row['id']} выпиши ВСЕ факты по открытым вопросам (обычно 2–5, с цитатами из "
@@ -699,6 +708,12 @@ def cmd_fetch(a):
     if not row.get("published"):
         print("ВНИМ. Дата публикации не найдена на странице — укажите её: "
               f"pf.py source date --id {row['id']} --published ГГГГ-ММ-ДД (свежесть данных).")
+
+
+def print_source_snapshot(row: dict) -> None:
+    flags = f", ⚠ {','.join(row['flags'])}" if row.get("flags") else ""
+    print(f"{row['id']}\t{row['title'][:80]}\t{row.get('chars', 0)} симв.\t"
+          f"дата: {row.get('published') or '—'}\t{row.get('text')}{flags}")
 
 
 def http_get(url: str, timeout: int) -> tuple[bytes, str]:
@@ -798,6 +813,28 @@ def cmd_source(a):
                 fl += " (разобрано)"
             print(f"{r['id']}\t{r['kind']}\t{r.get('reliability') or '-'}\t"
                   f"{r['title'][:70]}\t{r.get('url') or r.get('path') or ''}{fl}")
+    elif a.action == "read":
+        ids = list(dict.fromkeys(split_ids(a.id)))
+        if not ids:
+            die("укажите --id S001,S002")
+        rows = {r["id"]: r for r in read_jsonl(p.sources)}
+        unknown = [sid for sid in ids if sid not in rows]
+        if unknown:
+            die(f"неизвестные источники: {', '.join(unknown)}")
+        seen = set(split_ids(a.seen))
+        pending = [sid for sid in ids if sid not in seen]
+        texts = source_texts(p, pending)
+        missing = [sid for sid in pending if sid not in texts]
+        if missing:
+            die(f"нет текстового снимка: {', '.join(missing)}")
+        skipped = [sid for sid in ids if sid in seen]
+        if skipped:
+            print(f"Уже прочитаны в текущем контексте: {', '.join(skipped)}")
+        for sid in pending:
+            print_source_snapshot(rows[sid])
+            print(texts[sid].rstrip())
+        if pending:
+            print(f"\nПрочитаны: {','.join(pending)}")
 
 
 # ---------------------------------------------------------------- утверждения
@@ -864,6 +901,103 @@ def dropped_hedges(quote: str, text: str) -> list[str]:
     return found
 
 
+SMALL_NUMBERS = {
+    word: str(n) for n, forms in enumerate(("one один одного одну", "two два две двух", "three три трех",
+                                          "four четыре четырех", "five пять пяти", "six шесть шести",
+                                          "seven семь семи", "eight восемь восьми", "nine девять девяти",
+                                          "ten десять десяти"), 1) for word in forms.split()
+}
+AMOUNT_RE = re.compile(
+    rf"\b(?P<number>\d+(?:[.,]\d+)?|{'|'.join(SMALL_NUMBERS)})\s*"
+    r"(?:(?:barista[- ](?:made|prepared)|hot|горяч\w*|free|бесплатн\w*)\s+){0,2}"
+    r"(?:(?P<drinks>напит\w*|чаш\w*|drinks?|coffees?|beverages?)\b|"
+    r"(?P<percent>%|percent\b|процент\w*\b)|(?P<rubles>₽|руб(?:лей|ля|ль|\.)?\b))"
+)
+UPPER_PREFIX = re.compile(r"(?:\b(?:до|не (?:более|больше|выше)|максимум|лимит(?: в)?|up to|"
+                          r"at most|no more than|a maximum of)\s*|≤\s*|"
+                          r"\b\d+(?:[.,]\d+)?\s*%?\s*-\s*)$")
+ENDPOINT_PREFIX = re.compile(r"\b(?:поднимется|поднял\w*|вырастет|вырос\w*|повысил\w*|повысится|"
+                             r"увеличил\w*|увеличится|снизил\w*|снизится|упадет|упал\w*)\s+до\s*$")
+LOWER_OR_CONDITIONAL_PREFIX = re.compile(r"\b(?:от|свыше|более|не менее|как минимум|при|если|"
+                                        r"at least|more than|from)\s*$")
+
+
+def quantities(text: str) -> tuple[dict, dict]:
+    """Верхние границы и явно названные количества по значению и единице."""
+    upper, literal = {}, {}
+    text = _norm(text)
+    for m in AMOUNT_RE.finditer(text):
+        number = m["number"]
+        unit = next(unit for unit in ("drinks", "percent", "rubles") if m[unit])
+        key = (SMALL_NUMBERS.get(number, number.replace(",", ".")), unit)
+        prefix = text[max(0, m.start() - 30):m.start()]
+        if UPPER_PREFIX.search(prefix) and not ENDPOINT_PREFIX.search(prefix):
+            upper[key] = m[0]
+        elif not LOWER_OR_CONDITIONAL_PREFIX.search(prefix):
+            literal[key] = m[0]
+    return upper, literal
+
+
+PLAN_CUE = re.compile(r"\b(?:will|plans? to|planned to|is set to|announc(?:ed|es|ement)|планиру\w*|планировал\w*|"
+                      r"анонс\w*|буд(?:ет|ут)|собира\w*|намерен\w*)\b")
+CLAUSE_SPLIT = re.compile(r"(?<=[.!?])\s+|[;…]")
+NON_FACT_PREFIX = re.compile(r"\b(?:will|to)\s+(?:be\s+)?$|\bне\s*$|\b(?:если|if)\b[^,]{0,60}$")
+EVENT_PATTERNS = {
+    "запуск": (re.compile(r"\b(?:launch\w*|introduc\w*|roll out|запус\w*|введ\w*|ввод\w*)\b"),
+               re.compile(r"\b(?:запустил\w*|ввел\w*|заработал\w*|launched|introduced|rolled out)\b")),
+    "смена или закрытие": (
+        re.compile(r"\b(?:replac\w*|revamp\w*|scrapp?\w*|end|terminat\w*|discontinu\w*|"
+                   r"замен\w*|отмен\w*|передел\w*|сверн\w*|закры\w*|перехо\w*|сокра\w*)\b"),
+        re.compile(r"\b(?:заменил\w*|отменил\w*|свернул\w*|закрыл\w*|переш(?:ел|ла|ли)|"
+                   r"сократил\w*|replaced|revamped|scrapped|ended|terminated|discontinued)\b"),
+    ),
+}
+
+
+def completed_event(text: str, completed: re.Pattern) -> bool:
+    for fragment in CLAUSE_SPLIT.split(text):
+        for m in completed.finditer(fragment):
+            if not NON_FACT_PREFIX.search(fragment[:m.start()]):
+                return True
+    return False
+
+
+def source_plans(quote: str, snapshots: dict[str, str]) -> list[str]:
+    quoted = _norm(quote)
+    candidates = [(name, action, completed) for name, (action, completed) in EVENT_PATTERNS.items()
+                  if action.search(quoted)]
+    if not candidates:
+        return []
+    # Снимок часто повторяет лид в метаданных и в статье. Берём продолжение из тела статьи,
+    # где стоит дата вступления изменений в силу. Верхние границы смотрим только в цитате.
+    passages = [quoted]
+    for raw in snapshots.values():
+        snapshot = _norm(raw)
+        start = snapshot.rfind(quoted)
+        if start >= 0:
+            passages.append(snapshot[start:start + len(quoted) + 380])
+    plans = []
+    for name, action, completed in candidates:
+        if any(completed_event(t, completed) for t in passages):
+            continue
+        if any(action.search(s) and PLAN_CUE.search(s)
+               for passage in passages for s in CLAUSE_SPLIT.split(passage)):
+            plans.append(name)
+    return plans
+
+
+def semantic_issues(quote: str, plans: list[str], text: str) -> list[str]:
+    """Узкие признаки усиления: снять оговорку с числа или выдать план за событие."""
+    source_upper, source_literal = quantities(quote)
+    own_upper, own_literal = quantities(text)
+    issues = [f"потеряна верхняя граница для «{own_literal[key]}»"
+              for key in own_literal if key in source_upper and key not in own_upper and key not in source_literal]
+    for name in plans:
+        if completed_event(_norm(text), EVENT_PATTERNS[name][1]):
+            issues.append(f"{name}: в источнике описан план, а в тексте — состоявшееся событие")
+    return issues
+
+
 def provenance(s: dict) -> str:
     """fetched — снимок скачан pf.py; file — файл PM; excerpt — веб-текст вставлен агентом;
     search — сводка поиска без URL; human — слова PM/интервью."""
@@ -908,6 +1042,9 @@ def verify_claim(p: P, c: dict) -> dict:
     if all(sid in tables for sid in texts):
         return res
     res["dropped_hedges"] = dropped_hedges(q, c["text"]) if q else []
+    if q and res["quote"] in ("exact", "approx"):
+        res["source_plans"] = source_plans(q, texts)
+        res["semantic_issues"] = semantic_issues(q, res["source_plans"], c["text"])
     src_nums = _numbers(full)
     # Числа из утверждений, из которых выведено это, тоже считаются подтверждёнными.
     allc = {x["id"]: x for x in read_jsonl(p.claims)}
@@ -981,6 +1118,8 @@ def cmd_claim(a):
         if v.get("dropped_hedges"):
             print(f"ВНИМ. В цитате есть оговорка «{', '.join(v['dropped_hedges'])}», а в утверждении её "
                   f"нет — не превращайте «часто/до/по оценкам» в общее правило.")
+        for issue in v.get("semantic_issues", []):
+            print(f"ВНИМ. {cid}: {issue}. Сверьте с {', '.join(srcs)}.")
         if v.get("provenance") == "excerpt":
             print("ВНИМ. Факт опирается только на выдержку, вставленную вручную, а не на скачанную "
                   "страницу: цитата сверена с выдержкой. В документе пометьте «по выдержке».")
@@ -1097,16 +1236,52 @@ def verdicts_path(p: P) -> Path:
     return p.d / "evidence" / "verdicts.jsonl"
 
 
+def print_cited_claims(p: P, text: str) -> None:
+    ids = sorted({ref for group in CITE_RE.findall(text) for ref in split_ids(group)
+                  if ref.startswith("C")})
+    if not ids:
+        return
+    claims = {c["id"]: c for c in read_jsonl(p.claims)}
+    print("\n## Утверждения по ссылкам в тексте")
+    for cid in ids:
+        c = claims.get(cid)
+        if c is None:
+            print(f"{cid}: нет в реестре")
+            continue
+        status = f", {c['status']}" if c["status"] != "active" else ""
+        confidence = f"/{c['confidence']}" if c.get("confidence") else ""
+        sources = f" ← {', '.join(c['sources'])}" if c.get("sources") else ""
+        if sources and (c.get("verification") or {}).get("provenance") == "excerpt":
+            sources += " (по выдержке)"
+        derived = f" ⇐ {', '.join(c['derived_from'])}" if c.get("derived_from") else ""
+        print(f"{cid} [{c['kind']}{confidence}{status}] {c['text']}{sources}{derived}")
+        for key, label in (("locator", "Место"), ("quote", "Цитата"), ("range", "Диапазон"),
+                           ("switch", "Смена выбора"), ("retract_reason", "Причина отзыва")):
+            if c.get(key):
+                print(f"  {label}: {c[key]}")
+        if c.get("superseded_by"):
+            print(f"  Заменено: {', '.join(c['superseded_by'])}")
+
+
 def cmd_verdict(a):
     """Результат независимой проверки, привязанный к версии документа (отпечаток sha)."""
     p = P(project_dir(a.project))
+    tgt = (a.target or "").replace("\\", "/")
+    if tgt.startswith(f"projects/{p.d.name}/"):
+        tgt = tgt[len(f"projects/{p.d.name}/"):]
+    if a.action == "context":
+        target = (p.d / tgt).resolve()
+        if not tgt or not target.is_relative_to(p.d.resolve()) or not target.is_file():
+            die("--target: путь к документу внутри проекта")
+        document = target.read_text(encoding="utf-8")
+        print(f"## Документ {tgt}\n{document.rstrip()}")
+        print_cited_claims(p, document)
+        return
+
     rows = read_jsonl(verdicts_path(p))
     if a.action == "add":
         if a.role not in VERDICT_ROLES:
             die(f"--role: {', '.join(VERDICT_ROLES)}")
-        tgt = (a.target or "").replace("\\", "/")
-        if tgt.startswith(f"projects/{p.d.name}/"):
-            tgt = tgt[len(f"projects/{p.d.name}/"):]
         sha = file_sha(p, tgt) or die(f"нет файла {tgt} в проекте")
         if not a.text:
             die("--text: сами вердикты/возражения/что искали и что нашли")
@@ -1129,7 +1304,6 @@ def cmd_verdict(a):
         # Что изменилось в документе после последней проверки этой роли — повторную проверку
         # достаточно провести только по этим строкам.
         import difflib
-        tgt = (a.target or "").replace("\\", "/")
         mine = [v for v in rows if v["role"] == a.role and v["target"] == tgt]
         if not mine:
             die(f"проверок {a.role} по {tgt} ещё не было — проверьте весь документ")
@@ -1139,6 +1313,15 @@ def cmd_verdict(a):
             die(f"у {last['id']} нет снимка текста — проверьте весь документ")
         old = snap.read_text(encoding="utf-8").splitlines()
         new = (p.d / tgt).read_text(encoding="utf-8").splitlines()
+        if a.evidence:
+            diff = list(difflib.unified_diff(old, new, n=2, lineterm=""))[2:]
+            if diff:
+                print(f"Изменения после {last['id']}. Строки с «+» — на проверку, соседние — для контекста.")
+                print("\n".join(diff))
+                print_cited_claims(p, "\n".join(ln[1:] for ln in diff if ln.startswith(("+", " "))))
+            else:
+                print(f"{tgt} не изменился после {last['id']}")
+            return
         diff = [ln for ln in difflib.ndiff(old, new) if ln[:2] in ("+ ", "- ")]
         if not diff:
             print(f"{tgt} не изменился после {last['id']} — повторная проверка не нужна")
@@ -1202,6 +1385,56 @@ def cmd_digest(a):
     problems, warnings = collect_checks(p, release=True)
     print(f"\n## Выпускная проверка: ошибок {len(problems)}, предупреждений {len(warnings)}"
           f" — подробно: pf.py check --release")
+
+
+def cmd_focus(a):
+    """Покрытие ключевых вопросов перед следующим поиском."""
+    p = P(project_dir(a.project))
+    questions = load_state(p).get("key_questions") or []
+    requested = set(split_ids(a.q))
+    unknown = requested - {q["id"] for q in questions}
+    if unknown:
+        die(f"неизвестные вопросы: {', '.join(sorted(unknown))}")
+    active = [c for c in read_jsonl(p.claims) if c["status"] == "active"]
+    srcs = {s["id"]: s for s in read_jsonl(p.sources)}
+    priority = {"high": 0, "medium": 1, "low": 2}
+    gaps = sorted((g for g in read_jsonl(p.gaps) if g["status"] == "open"),
+                  key=lambda g: (priority.get(g.get("impact"), 3), g["id"]))
+    if not questions:
+        print("Ключевых вопросов ещё нет. Сформулируйте, какие ответы могут изменить решение.")
+    for q in questions:
+        qid = q["id"]
+        if requested and qid not in requested:
+            continue
+        answers = [c for c in active if c.get("question") == qid or c["id"] in (q.get("answer_claims") or [])]
+        facts = [c for c in answers if c["kind"] == "fact"]
+        sources = sorted({sid for c in facts for sid in c["sources"] if sid in srcs})
+        roots = sorted({source_root(srcs, sid) for sid in sources})
+        print(f"\n{qid} [{q.get('status', 'open')}] {q['text']}")
+        if q.get("why_matters"):
+            print(f"  Что меняет: {q['why_matters']}")
+        if facts:
+            print(f"  Факты: {', '.join(c['id'] for c in facts)}. "
+                  f"Источники: {', '.join(sources) or '—'}. По цепочкам пересказов: {', '.join(roots) or '—'}.")
+        else:
+            print("  Привязанных фактов пока нет.")
+        other = [f"{c['id']} ({c['kind']})" for c in answers if c["kind"] != "fact"]
+        if other:
+            print(f"  Другие основания: {', '.join(other)}")
+        for g in gaps:
+            if g.get("question") == qid:
+                print(f"  {g['id']} [{g.get('impact') or '—'}] {g['text']}")
+                if g.get("how_to_close"):
+                    print(f"    Как закрыть: {g['how_to_close']}")
+    if not requested:
+        question_ids = {q["id"] for q in questions}
+        unlinked = [g for g in gaps if g.get("question") not in question_ids]
+        if unlinked:
+            print("\nПробелы без ключевого вопроса (проверьте связь с решением):")
+            for g in unlinked:
+                print(f"  {g['id']} [{g.get('impact') or '—'}] {g['text']}")
+    print("\nСледующий поиск — по пробелу, ответ на который может изменить выбор, "
+          "или по существенному противоречию. Сначала проверьте уже собранные источники.")
 
 
 def cmd_gap(a):
@@ -1407,6 +1640,36 @@ def cited_in_deliverables(p: P) -> set[str]:
 SECTION_RE = re.compile(r"^\s*(?:#{1,4}\s*|\*\*)(Ответ|Почему|Что происходит|Что показали|"
                         r"Главное|Вывод)", re.I)
 HEADER_RE = re.compile(r"^\s*(?:#{1,4}\s|\*\*[^*]+:\*\*)")
+FOUNDATIONS_HEADER = re.compile(r"^\s*#{1,6}\s+Сверка оснований рекомендации\s*$", re.I)
+FOUNDATIONS_COLUMNS = ["Вывод", "Основание", "Что может опровергнуть", "Когда меняем решение"]
+
+
+def foundation_errors(text: str, claims: dict, gaps: dict) -> list[str]:
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if FOUNDATIONS_HEADER.match(line)), None)
+    if start is None:
+        return []  # Отчёты, выпущенные до появления раздела.
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^\s*#{1,6}\s", lines[i])), len(lines))
+    table = []
+    for i in range(start + 1, end):
+        line = lines[i].strip()
+        if line.startswith("|"):
+            body = line[1:].removesuffix("|")
+            table.append((i + 1, [cell.strip() for cell in re.split(r"(?<!\\)\|", body)]))
+    if len(table) < 3 or table[0][1] != FOUNDATIONS_COLUMNS or len(table[1][1]) != 4 or \
+            not all(re.fullmatch(r":?-{3,}:?", cell) for cell in table[1][1]):
+        return [f"{start + 1}: добавьте заполненную таблицу «{' | '.join(FOUNDATIONS_COLUMNS)}»"]
+    errors = []
+    for line, cells in table[2:]:
+        if len(cells) != 4 or any(cell in ("", "…", "...", "—", "-") for cell in cells):
+            errors.append(f"{line}: заполните все четыре поля сверки оснований рекомендации")
+            continue
+        refs = {ref for group in CITE_RE.findall(cells[1]) for ref in split_ids(group)}
+        eligible = any(claims.get(ref, {}).get("status") == "active" and
+                       claims[ref]["kind"] != "synthetic" for ref in refs)
+        if not eligible and not any(gaps.get(ref, {}).get("status") == "open" for ref in refs):
+            errors.append(f"{line}: в основании укажите действующее [C…] или открытый пробел [G…]")
+    return errors
 
 
 def uncited_reasoning(text: str) -> list[str]:
@@ -1458,6 +1721,7 @@ def collect_checks(p: P, release: bool = False) -> tuple[list[str], list[str]]:
             problems.append(f"реестр {name}: повторяющиеся ID {', '.join(dups)} — записи затёрты "
                             f"параллельной записью; восстановите вручную по журналу")
     used = cited_in_deliverables(p)
+    semantic_evidence = {}
     for c in claims.values():
         if c["status"] != "active":
             continue
@@ -1511,6 +1775,10 @@ def collect_checks(p: P, release: bool = False) -> tuple[list[str], list[str]]:
             if v.get("dropped_hedges"):
                 warnings.append(f"{c['id']}: в цитате оговорка «{', '.join(v['dropped_hedges'])}», "
                                 f"в утверждении — нет; формулировка сильнее источника")
+            for issue in v.get("semantic_issues", []):
+                warnings.append(f"{c['id']}: {issue}. Сверьте с {', '.join(c['sources'])}.")
+            if in_doc and "source_plans" in v:
+                semantic_evidence[c["id"]] = v
             if v.get("provenance") == "excerpt":
                 warnings.append(f"{c['id']}: факт стоит только на выдержке без снимка страницы "
                                 f"({', '.join(c['sources'])}) — сверка цитаты условна")
@@ -1522,8 +1790,21 @@ def collect_checks(p: P, release: bool = False) -> tuple[list[str], list[str]]:
             continue
         text = f.read_text(encoding="utf-8")
         rel = f.relative_to(p.d)
+        if rel.parts[0] == "deliverables":
+            strict.extend(f"{rel}:{error}" for error in foundation_errors(text, claims, gaps))
         for ln, line in enumerate(text.splitlines(), 1):
-            for grp in CITE_RE.findall(line):
+            citations = CITE_RE.findall(line)
+            if rel.parts[0] == "deliverables" and citations and not HISTORY_RE.search(line):
+                fact_refs = {r for grp in citations for r in split_ids(grp) if r.startswith("C")}
+                if len(fact_refs) == 1:
+                    ref = next(iter(fact_refs))
+                    if ref in semantic_evidence:
+                        c, v = claims[ref], semantic_evidence[ref]
+                        for issue in semantic_issues(c["quote"], v["source_plans"], CITE_RE.sub("", line)):
+                            if issue not in v["semantic_issues"]:
+                                warnings.append(f"{rel}:{ln}: {ref}: {issue}. "
+                                                f"Сверьте с {', '.join(c['sources'])}.")
+            for grp in citations:
                 for ref in split_ids(grp):
                     if ref.startswith("C"):
                         c = claims.get(ref)
@@ -2375,7 +2656,8 @@ def cmd_batch(a):
             die(f"строка {n}: вложенный batch не поддерживается")
         if a.project and "--project" not in args and "-p" not in args:
             args = ["--project", a.project] + args
-        print(f"> {line}")
+        if not a.quiet:
+            print(f"> {line}")
         try:
             sub = ap.parse_args(args)
             if sub.fn is cmd_fetch:  # загрузка не держит блокировку, как и вне batch
@@ -2436,15 +2718,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sp.add_parser("fetch", help="скачать веб-страницу/файл и зарегистрировать источник")
     s.add_argument("url"); src_opts(s); s.add_argument("--timeout", type=int, default=45)
+    s.add_argument("--reuse", action="store_true", help="использовать сохранённый снимок этого URL")
     s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_fetch)
 
     s = sp.add_parser("ingest", help="зарегистрировать локальный файл или папку")
     s.add_argument("path"); s.add_argument("--kind"); src_opts(s); s.set_defaults(fn=cmd_ingest)
 
-    s = sp.add_parser("source", help="источники: add (заметка/интервью/результат поиска) | list | reviewed (подозрительное содержимое разобрано)")
-    s.add_argument("action", choices=["add", "list", "reviewed", "date", "retells"])
+    s = sp.add_parser("source", help="источники: add | list | read | reviewed | date | retells")
+    s.add_argument("action", choices=["add", "list", "read", "reviewed", "date", "retells"])
     s.add_argument("--url"); s.add_argument("--text")
-    s.add_argument("--id", help="reviewed: ID источника")
+    s.add_argument("--id", help="ID источника, для read — один или несколько через запятую")
+    s.add_argument("--seen", help="read: ID снимков, уже полученных в текущем контексте")
     s.add_argument("--kind", choices=["web", "document", "table", "interview", "synthetic",
                                       "image", "analysis", "note", "human"])
     src_opts(s); s.set_defaults(fn=cmd_source)
@@ -2479,14 +2763,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--trigger", help="условие пересмотра"); s.add_argument("--review-date", dest="review_date")
     s.set_defaults(fn=cmd_decision)
 
-    s = sp.add_parser("verdict", help="независимые проверки: add | diff | list")
-    s.add_argument("action", choices=["add", "diff", "list"])
+    s = sp.add_parser("verdict", help="независимые проверки: add | context | diff | list")
+    s.add_argument("action", choices=["add", "context", "diff", "list"])
     s.add_argument("--role", choices=list(VERDICT_ROLES)); s.add_argument("--target")
     s.add_argument("--text"); s.add_argument("--executor", choices=["subagent", "self"])
+    s.add_argument("--evidence", action="store_true", help="diff: соседние строки и полные цитаты")
     s.set_defaults(fn=cmd_verdict)
 
     s = sp.add_parser("digest", help="весь реестр одним компактным выводом (для написания итога)")
     s.set_defaults(fn=cmd_digest)
+
+    s = sp.add_parser("focus", help="покрытие ключевых вопросов и открытые пробелы перед поиском")
+    s.add_argument("--q", help="ID вопросов через запятую, по умолчанию — все")
+    s.set_defaults(fn=cmd_focus)
 
     s = sp.add_parser("review", help="что пора пересмотреть")
     s.add_argument("--days", type=int, default=90); s.set_defaults(fn=cmd_review)
@@ -2528,17 +2817,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sp.add_parser("batch", help="выполнить команды pf.py из файла (по одной на строку; '-' — stdin)")
     s.add_argument("file"); s.set_defaults(fn=cmd_batch)
+    s.add_argument("--quiet", action="store_true", help="выводить результаты команд без повтора входных строк")
     return ap
 
 
 # Без общего замка: только чтение, а fetch и batch берут замок сами — fetch после скачивания,
 # batch на каждую команду, чтобы долгие загрузки не держали параллельных субагентов.
-READ_ONLY = {"status", "list", "check", "impact", "cost", "review", "hook", "fetch", "digest", "batch"}
+READ_ONLY = {"status", "list", "check", "impact", "cost", "review", "hook", "fetch", "digest", "focus", "batch"}
 
 
 def main():
     a = build_parser().parse_args()
-    if a.cmd in READ_ONLY:
+    if a.cmd in READ_ONLY or (a.cmd == "source" and a.action == "read"):
         a.fn(a)
     else:
         with project_lock():

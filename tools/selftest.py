@@ -1,23 +1,23 @@
 """Сквозная самопроверка pf.py на временном проекте: python3 tools/selftest.py
 
 Проходит основные команды и проверяет ключевые защиты (факт без источника, неверная цитата,
-искажённое число, отзыв и поиск затронутого). Проект удаляется в конце; активный проект
-восстанавливается.
+искажённое число, отзыв и поиск затронутого). Все команды работают во временной папке проектов.
 """
-import shutil
+from functools import partial
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SLUG = "_selftest"
-ACTIVE = ROOT / "projects" / ".active"
 failures = []
 
 
-def pf(*args, ok=True, expect=None, absent=None):
+def run_pf(*args, env, ok=True, expect=None, absent=None):
     r = subprocess.run([sys.executable, str(ROOT / "tools" / "pf.py"), "--project", SLUG, *args],
-                       capture_output=True, text=True, encoding="utf-8")
+                       env=env, capture_output=True, text=True, encoding="utf-8")
     out = r.stdout + r.stderr
     name = " ".join(args)[:70]
     if ok and r.returncode != 0:
@@ -37,10 +37,10 @@ def main():
     if size > 28000:
         failures.append(f"AGENTS.md {size} байт — ближе 28 КБ к лимиту Codex (32 КБ); вынесите "
                         f"подробности в .claude/skills/ или knowledge/")
-    prev = ACTIVE.read_text(encoding="utf-8") if ACTIVE.exists() else None
-    d = ROOT / "projects" / SLUG
-    shutil.rmtree(d, ignore_errors=True)
-    try:
+    with tempfile.TemporaryDirectory(prefix="pf-selftest-") as tmp:
+        env = {**os.environ, "PF_PROJECTS_DIR": tmp}
+        pf = partial(run_pf, env=env)
+        d = Path(tmp) / SLUG
         pf("init", SLUG, "--title", "Самопроверка")
         pf("source", "add", "--kind", "note", "--title", "Заметка",
            "--text", "Компания продаёт eSIM для двухсот стран. Цена 599 рублей в месяц.")
@@ -88,10 +88,11 @@ def main():
         # Параллельная запись: 8 процессов одновременно — ID не должны повториться
         procs = [subprocess.Popen([sys.executable, str(ROOT / "tools" / "pf.py"), "--project", SLUG,
                                    "claim", "add", f"Гипотеза {i}", "--kind", "hypothesis"],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                  env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                  for i in range(8)]
         for pr in procs:
-            pr.wait()
+            if pr.wait() != 0:
+                failures.append("Параллельная запись утверждений завершилась ошибкой")
         pf("check", absent="повторяющиеся ID")
 
         # Косвенно отозванное основание решения всплывает в review
@@ -143,10 +144,6 @@ def main():
         sm.write_text(sm.read_text(encoding="utf-8") + "\nЕщё [C003] и [C016].\n", encoding="utf-8")
         pf("check", expect="пересказы одного первоисточника S001")
         pf("claim", "switch", "C003", "--range", "3..8%", "--switch", "при <3% → вариант A")
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-        if prev is not None:
-            ACTIVE.write_text(prev, encoding="utf-8")
     if failures:
         print("САМОПРОВЕРКА НЕ ПРОЙДЕНА:\n\n" + "\n\n".join(failures))
         sys.exit(1)
