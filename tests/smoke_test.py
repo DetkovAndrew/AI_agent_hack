@@ -4,6 +4,7 @@
 Запуск из корня репозитория:  python3 tests/smoke_test.py
 Проекты создаются во временной папке (PF_PROJECTS_DIR), рабочие projects/ не трогаются.
 """
+import csv
 import json
 import os
 import runpy
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +53,222 @@ class PfSmoke(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("факт без источника", r.stderr)
         self.pf("claim", "add", "Рынок, вероятно, растёт", "--kind", "hypothesis")
+
+    def test_pilot_economics_applies_same_parity_rule_after_correction(self):
+        tool = ROOT / "tools" / "pilot_economics.py"
+        inputs = ["--months", "2", "--control-price", "429", "--test-price", "349",
+                  "--control-cost", "75", "--test-cost", "75", "--test-upfront", "2",
+                  "--test-renewal", "82", "92"]
+        def check(rate, *args):
+            return subprocess.run([sys.executable, str(tool), "--control-renewal", rate, *args],
+                                  capture_output=True, env=self.env, text=True, encoding="utf-8")
+
+        initial = check("78", *inputs)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        for amount in ("491.49", "546.00", "93.22%", "-84.58", "-9.50"):
+            self.assertIn(amount, initial.stdout)
+        corrected = check("92", *inputs)
+        self.assertEqual(corrected.returncode, 0, corrected.stderr)
+        self.assertIn("625.31", corrected.stdout)
+        self.assertIn("Паритет в этом сценарии недостижим", corrected.stdout)
+        revenue = check("78.10", "--months", "1", "--control-price", "100", "--test-price", "100")
+        self.assertIn("78.10%", revenue.stdout)
+        self.assertIn("подписочная выручка", revenue.stdout)
+        self.assertEqual(check("101", *inputs).returncode, 2)
+
+    def test_decision_pilot_freezes_terms_and_recalculates_from_new_evidence(self):
+        self.pf("question", "add", "Допускает ли экономика ценовой пилот?")
+        conditions = "Цена контроля 429, теста 349, расходы 75 и приглашение 2. Горизонт два продления."
+        original = "Из 10000 клиентов после первого продления активны 7800."
+        correction = "Из 10000 клиентов после первого продления активны 9200."
+        for text in (conditions, original, correction):
+            sid = self.add_source(text)
+            self.pf("claim", "add", text, "--kind", "fact", "--src", sid, "--quote", text, "--q", "Q001")
+        trigger = "Вклад теста при 100% должен достигать вклада контроля"
+        self.pf("decision", "add", "--title", "Подготовить пилот", "--trigger", trigger)
+        self.pf("set", "brief.depth", "full")
+        target = "deliverables/summary.md"
+        authored = "## Ответ\nРешение о запуске согласует директор. [C001]\n"
+        self.write_doc("summary.md", authored)
+        review = ("verdict", "add", "--role", "fidelity", "--target", target, "--text", "Сверено",
+                  "--executor", "subagent")
+        self.pf(*review)
+        configured = self.pf("decision", "pilot", "--id", "D001", "--months", "2", "--control-price", "429",
+                             "--test-price", "349", "--control-cost", "75", "--test-cost", "75", "--test-upfront", "2",
+                             "--fixed-basis", "C001", "--control-renewal", "78", "--basis", "C002")
+        self.assertIn("Контроль 491.49, тест при 100% 546.00", configured.stdout)
+        cohort = "В той же когорте из 10000 после первого продления 9200 оплат, после второго 8464."
+        terms = "Цены, расходы, горизонт и порог остаются прежними."
+        replacement = "Первую выгрузку отзываем после сверки."
+        correction_sid = self.add_source(f"{replacement}\n{cohort}\n{terms}")
+        proposal = dict(status="ready", terms=terms, replacement=replacement, observations=cohort,
+                        cohort=[10000, 9200, 8464])
+        state_files = [self.proj / "decisions" / "decisions.jsonl", self.proj / "evidence" / "claims.jsonl"]
+        snapshot = [p.read_bytes() for p in state_files]
+        triage = ("pilot-triage", "--id", "D001", "--source", correction_sid, "--proposal", "-")
+        preview = self.pf(*triage, stdin=json.dumps(proposal))
+        self.assertIn("Финансовый порог не выполняется", preview.stdout)
+        self.assertIn("491,49 → 625,31", preview.stdout)
+        self.assertIn("Тест минус контроль — -79,31", preview.stdout)
+        self.assertEqual([p.read_bytes() for p in state_files], snapshot)
+        invented = self.pf(*triage, stdin=json.dumps({**proposal, "cohort": [10000, 9500, 8464]}), ok=False)
+        self.assertNotEqual(invented.returncode, 0)
+        self.assertIn("должны совпадать с цитатой", invented.stderr)
+        conflict = self.add_source(f"{replacement}\n{cohort}\n{terms}\nЦена изменилась до 999 ₽.")
+        rejected = self.pf("pilot-triage", "--id", "D001", "--source", conflict, "--proposal", "-",
+                           stdin=json.dumps(proposal), ok=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("не подтверждена неизменность", rejected.stderr)
+        changed = self.pf("check", "--release", "--strict", ok=False)
+        self.assertEqual(changed.returncode, 3, changed.stdout)
+        self.assertIn("изменился финансовый блок", changed.stdout)
+        context = self.pf("verdict", "context", "--target", target).stdout
+        self.assertIn("**Порог по вкладу выполнен.**", context)
+        self.assertIn("в контроле — 491,49, в тесте при 100% продления — 546,00", context)
+        self.pf(*review)
+        self.pf("report", "--html")
+        report_path = self.proj / "deliverables" / "REPORT.md"
+        before = report_path.read_text(encoding="utf-8")
+        self.assertLess(before.index("## Финансовый допуск пилота"), before.index("## Ответ"))
+        template = Path(self.tmp.name) / "pilot-template.csv"
+        template_cmd = ("pilot-triage", "--id", "D001", "--csv-template", str(template))
+        self.pf(*template_cmd)
+        with template.open(encoding="utf-8-sig", newline="") as source:
+            rows = csv.reader(source, delimiter=";")
+            header = next(rows)
+            template_fields = dict(rows)
+        self.assertEqual(header, ["field", "value"])
+        for field in ("same_control_cohort", "conditions_unchanged", "period_0", "period_1", "period_2"):
+            self.assertEqual(template_fields[field], "")
+        original_template = template.read_bytes()
+        self.assertIn("файл уже существует", self.pf(*template_cmd, ok=False).stderr)
+        self.assertEqual(template.read_bytes(), original_template)
+        fields = {**template_fields, "same_control_cohort": "да", "conditions_unchanged": "да",
+                  "control_renewal_pct": "92,0", "period_0": "10 000", "period_1": "9200", "period_2": "8464"}
+        csv_path = Path(self.tmp.name) / "pilot-correction.csv"
+        upload = ("pilot-triage", "--id", "D001", "--file", str(csv_path))
+
+        def write_csv(path, values, *, extra=()):
+            with path.open("w", encoding="utf-8-sig", newline="") as output:
+                writer = csv.writer(output)
+                writer.writerow(header)
+                writer.writerows(values.items())
+                writer.writerows(extra)
+
+        write_csv(csv_path, fields)
+        with patch.dict(self.env, {"PATH": ""}):
+            valid = self.pf(*upload).stdout
+        self.assertIn("491,49 → 625,31", valid)
+        self.assertIn("Тест минус контроль — -79,31", valid)
+        self.assertIn("10 000 → 9 200 → 8 464", valid)
+        self.assertIn("Постоянный сценарий 92%", valid)
+        registry = self.proj / "sources" / "registry.jsonl"
+        source_rows = [json.loads(line) for line in registry.read_text(encoding="utf-8").splitlines()]
+        self.assertIn(f"CSV [{source_rows[-1]['id']}]", valid)
+        self.assertEqual((self.proj / source_rows[-1]["raw"]).read_bytes(), csv_path.read_bytes())
+        self.assertEqual(self.pf(*upload).stdout, valid)
+        registry_snapshot = registry.read_bytes()
+        rejected_csv = Path(self.tmp.name) / "rejected.csv"
+        for updates, extra, message in (
+            ({"same_control_cohort": ""}, (), "контрольная когорта та же"),
+            ({"conditions_unchanged": "нет"}, (), "цены, затраты, горизонт и порог прежние"),
+            ({"decision_id": "D002"}, (), "другому решению"),
+            ({"pilot_revision": "0" * 64}, (), "другой версии пилота"),
+            ({"test_price": "999"}, (), "отсутствует в шаблоне"),
+            ({}, (("period_2", "9000"),), "повтор поля"),
+            ({"period_2": ""}, (), "целая численность"),
+            ({"period_2": "10001"}, (), "невозрастающей численности"),
+            ({"control_renewal_pct": "90"}, (), "расходится с числом"),
+            ({"control_renewal_pct": "", "period_2": "8000"}, (), "различается по периодам"),
+        ):
+            with self.subTest(message=message):
+                write_csv(rejected_csv, {**fields, **updates}, extra=extra)
+                invalid = self.pf(*upload[:-1], str(rejected_csv), ok=False)
+                self.assertNotEqual(invalid.returncode, 0)
+                self.assertIn(message, invalid.stderr)
+                self.assertNotIn("Финансовый порог", invalid.stdout)
+        self.assertEqual(registry.read_bytes(), registry_snapshot)
+        self.assertEqual(report_path.read_text(encoding="utf-8"), before)
+        self.assertEqual([p.read_bytes() for p in state_files], snapshot)
+        decisions_path = self.proj / "decisions" / "decisions.jsonl"
+        saved_state = decisions_path.read_bytes()
+        packet = self.pf("revision-packet", "--id", "D001", "--source", "S003", "--review-rules").stdout
+        for value in ("Q001", "Контроль 491.49", "Входы: C002", original, correction,
+                      "Предыдущий авторский текст", "### fidelity", "### counter"):
+            self.assertIn(value, packet)
+        self.assertEqual(decisions_path.read_bytes(), saved_state)
+        missing = self.pf("revision-packet", "--id", "D001", "--source", "S999", ok=False)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("S999", missing.stderr)
+        self.pf("claim", "retract", "C002", "--by", "C003", "--reason", "Поправка")
+        self.assertIn("нужно пересчитать пилот", self.pf("review").stdout)
+        stale = self.pf("check", "--release", "--strict", ok=False)
+        self.assertEqual(stale.returncode, 3, stale.stdout)
+        self.assertIn("расчёт пилота устарел из-за C002", stale.stdout)
+        blocked = self.pf("report", ok=False)
+        self.assertEqual(blocked.returncode, 3, blocked.stdout)
+        self.assertEqual(report_path.read_text(encoding="utf-8"), before)
+        stale_context = self.pf("verdict", "context", "--target", target).stdout
+        self.assertIn("Расчёт устарел", stale_context)
+        self.assertNotIn("Порог по вкладу выполнен", stale_context)
+
+        args = ("decision", "pilot", "--id", "D001", "--control-renewal", "92", "--basis", "C003")
+        self.assertNotEqual(self.pf(*args, "--months", "3", ok=False).returncode, 0)
+        self.assertNotEqual(self.pf("decision", "edit", "--id", "D001", "--trigger", "Новый порог",
+                                    ok=False).returncode, 0)
+        recalculated = self.pf(*args)
+        self.assertIn("Контроль 625.31, тест при 100% 546.00", recalculated.stdout)
+        self.assertIn("не проходит", recalculated.stdout)
+        outdated_csv = self.pf(*upload, ok=False)
+        self.assertIn("другой версии пилота", outdated_csv.stderr)
+        show = self.pf("decision", "show", "--id", "D001").stdout
+        self.assertIn(trigger, show)
+        self.assertIn("Основания: C001, C003", show)
+        self.assertIn("D001 [active] Подготовить пилот", show)
+        ledger = self.proj / "decisions" / "decisions.jsonl"
+        state = ledger.read_bytes()
+        self.pf(*args)
+        self.assertEqual(state, ledger.read_bytes())
+        self.assertEqual((self.proj / target).read_text(encoding="utf-8"), authored)
+        blocked = self.pf("report", ok=False)
+        self.assertEqual(blocked.returncode, 3, blocked.stdout)
+        self.assertIn("изменился финансовый блок", blocked.stdout)
+        diff = self.pf("verdict", "diff", "--role", "fidelity", "--target", target, "--evidence")
+        self.assertIn("491,49", diff.stdout)
+        self.assertIn("625,31", diff.stdout)
+        self.assertIn("546,00", diff.stdout)
+        self.pf(*review)
+        self.pf("check", "--release", "--strict")
+        self.pf("report", "--html")
+        report = report_path.read_text(encoding="utf-8")
+        self.assertLess(report.index("## Финансовый допуск пилота"), report.index("## Ответ"))
+        self.assertIn("**Порог по вкладу не выполнен.**", report)
+        self.assertIn("в контроле — 625,31, в тесте при 100% продления — 546,00", report)
+        self.assertIn("Основания условий [C001]. Основания продления [C003]", report)
+        self.assertNotIn("491,49", report)
+        html = report_path.with_suffix(".html").read_text(encoding="utf-8")
+        self.assertIn("<h2>Финансовый допуск пилота</h2>", html)
+        self.assertIn("625,31", html)
+
+    def test_bundled_verdicts_keep_separate_roles_and_run_the_release_gate(self):
+        self.pf("question", "add", "Что делать?")
+        self.pf("claim", "add", "Спрос может вырасти", "--kind", "hypothesis", "--q", "Q001")
+        target = "deliverables/options.md"
+        self.write_doc("options.md", "## Оставить как есть\n## Возражения\n[C001]\n")
+        args = ("verdict", "add", "--target", target, "--executor", "subagent")
+        reports = ("--review", "red-team", "Проверка вариантов",
+                   "--review", "counter", "Поиск опровергающих данных")
+        result = self.pf(*args, *reports, "--check-release")
+        self.assertIn("V001\tred-team", result.stdout)
+        self.assertIn("V002\tcounter", result.stdout)
+        rows = [json.loads(line) for line in (self.proj / "evidence" / "verdicts.jsonl").read_text(
+            encoding="utf-8").splitlines()]
+        self.assertEqual(rows[0]["snapshot"], rows[1]["snapshot"])
+        self.assertNotEqual(rows[0]["text"], rows[1]["text"])
+        self.pf("claim", "switch", "C001", "--switch", "При отсутствии спроса закрыть")
+        result = self.pf(*args, *reports[:3], "--check-release", ok=False)
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("counter: deliverables/options.md: после V002 изменились основания C001", result.stdout)
 
     def test_injection_is_flagged(self):
         r = self.pf("source", "add", "--kind", "web", "--title", "отзывы",
@@ -319,6 +537,80 @@ class PfSmoke(unittest.TestCase):
         self.assertIn("C999: нет в реестре", diff)
         self.assertIn(quote, diff)  # Ссылка в соседней строке доступна при повторной проверке.
         self.assertNotIn("C002", diff)
+
+    def test_release_rechecks_only_verdicts_that_depend_on_changed_evidence(self):
+        self.env["PF_AGENT_ENV"] = "codex"
+        self.pf("set", "brief.depth", "full")
+        quote = "Выручка 2025 года — 10 млн руб."
+        sid = self.add_source(quote)
+        unused_sid = self.add_source("Несвязанный источник.")
+        self.pf("claim", "add", quote, "--kind", "fact", "--src", sid, "--quote", quote)
+        self.pf("claim", "add", "Пилот может увеличить выручку", "--kind", "hypothesis", "--derived", "C001")
+        self.pf("claim", "add", "Спрос может вырасти", "--kind", "hypothesis")
+        self.pf("question", "add", "Что может произойти со спросом?")
+        self.pf("question", "close", "Q001", "--claims", "C003")
+        self.pf("decision", "add", "--title", "Отложить пилот", "--basis", "C002", "--trigger", "Отток 60 тыс.")
+        target = "deliverables/options.md"
+        options = "## Оставить как есть\n## Возражения\nПересмотр [D001].\nОтдельная гипотеза [C003].\n"
+        self.write_doc("options.md", options)
+        self.write_doc("situation.md", "Отдельная гипотеза [C003].\n")
+        for role, doc in (("counter", target), ("red-team", target), ("fidelity", "deliverables/situation.md")):
+            self.pf("verdict", "add", "--role", role, "--target", doc, "--text", "Проверено",
+                    "--executor", "subagent")
+
+        self.pf("decision", "edit", "--id", "D001", "--review-date", "2026-12-01")
+        self.pf("source", "date", "--id", unused_sid, "--published", "2026-10-01")
+        self.pf("check", "--release", "--strict")
+
+        self.pf("decision", "edit", "--id", "D001", "--trigger", "Отток 55 тыс.")
+        self.pf("claim", "switch", "C001", "--switch", "Пересчёт при изменении методики")
+        snapshot = self.proj / "sources" / "text" / f"{sid}.md"
+        with snapshot.open("a", encoding="utf-8") as handle:
+            handle.write("\nУточнение: это предварительная оценка.\n")
+        self.assertEqual((self.proj / target).read_text(encoding="utf-8"), options)
+
+        changed = f"C001, D001, {sid}"
+        draft = self.pf("check", "--strict").stdout
+        self.assertIn(f"изменились основания {changed}", draft)
+        report = self.pf("check", "--release", "--strict", ok=False)
+        self.assertEqual(report.returncode, 3, report.stdout)
+        self.assertEqual(report.stdout.count(f"изменились основания {changed}"), 2, report.stdout)
+        self.assertNotIn("fidelity:", report.stdout)
+        index = self.pf("verdict", "list").stdout
+        self.assertEqual(index.count(f"устарела: {changed}"), 2, index)
+        self.assertIn("fidelity\tdeliverables/situation.md\tsubagent\tактуальна", index)
+        digest = self.pf("digest").stdout
+        self.assertEqual(digest.count(f"устарела: {changed}"), 2, digest)
+        diff = self.pf("verdict", "diff", "--role", "counter", "--target", target, "--evidence").stdout
+        self.assertIn(f"Изменились основания после V001: {changed}", diff)
+        self.assertIn(f"{target}:3: Пересмотр [D001]", diff)
+        self.assertIn("Условие пересмотра: Отток 55 тыс.", diff)
+        self.assertIn(quote, diff)
+        self.assertNotIn("C003", diff)
+        self.assertNotIn(unused_sid, diff)
+
+        for role in ("counter", "red-team"):
+            self.pf("verdict", "add", "--role", role, "--target", target, "--text", "Сверено повторно",
+                    "--executor", "subagent")
+        self.pf("check", "--release", "--strict")
+
+    def test_legacy_verdict_preserves_release_and_requests_full_evidence_review(self):
+        self.env["PF_AGENT_ENV"] = "codex"
+        self.pf("set", "brief.depth", "full")
+        self.pf("claim", "add", "Спрос может вырасти", "--kind", "hypothesis")
+        target = "deliverables/situation.md"
+        self.write_doc("situation.md", "Гипотеза [C001].\n")
+        self.pf("verdict", "add", "--role", "fidelity", "--target", target, "--text", "Проверено",
+                "--executor", "subagent")
+        path = self.proj / "evidence" / "verdicts.jsonl"
+        legacy = json.loads(path.read_text(encoding="utf-8"))
+        del legacy["dependencies"]
+        path.write_text(json.dumps(legacy, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        self.assertIn("сохранена только версия документа", self.pf("check", "--release", "--strict").stdout)
+        self.assertIn("основания не сохранены", self.pf("verdict", "list").stdout)
+        diff = self.pf("verdict", "diff", "--role", "fidelity", "--target", target).stdout
+        self.assertIn("Сверьте документ с реестром целиком.", diff)
 
     def test_semantic_check_on_known_errors_and_controls(self):
         pf = runpy.run_path(str(PF))
