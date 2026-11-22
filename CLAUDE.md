@@ -9,5 +9,5 @@
 - Процедуры этапов — skills `/pf-start`, `/pf-intake`, `/pf-collect`, `/pf-research`, `/pf-options`,
   `/pf-strategy`, `/pf-validation`, `/pf-decision`, `/pf-revise`, `/pf-interview`, `/pf-status`.
 - Субагенты — `.claude/agents/`: researcher, source-extractor, data-analyst, red-team,
-  synthetic-respondent, judge. Передавай им ID проекта и вопроса, а не весь контекст.
+  synthetic-respondent, judge, fidelity. Передавай им ID проекта и вопроса, а не весь контекст.
 - Команды `pf.py` запускай как `python3 tools/pf.py ...` из корня репозитория.

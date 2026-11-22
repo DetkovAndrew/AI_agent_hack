@@ -33,9 +33,12 @@
 ```bash
 git clone <repo> && cd <repo>
 pip install -r requirements.txt      # опционально: PDF и XLSX
-mkdir -p .claude && cp docs/claude-settings.proposed.json .claude/settings.json   # хуки и разрешения
 claude                               # запустить Claude Code в корне репозитория
 ```
+Хуки и разрешения уже лежат в `.claude/settings.json`. При первом запуске Claude Code спросит,
+доверяете ли вы папке: ответьте «Yes», иначе хуки и разрешения не включатся. В Windows
+вместо `python3` может понадобиться `python` или `.\pf.ps1` (см. «Codex на Windows»).
+
 В чате: `/pf-start` и опишите задачу своими словами, например:
 «Удержание в нашем приложении упало за полгода, надо понять, что делать. Вот выгрузка» —
 и приложите файлы. Агент сам задаст нужные вопросы и поведёт работу по этапам.
